@@ -17,8 +17,6 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA 
  */
-
-/*当transport接收到一个sip消息的时候*/
 #include <pjsip/sip_parser.h>
 #include <pjsip/sip_uri.h>
 #include <pjsip/sip_msg.h>
