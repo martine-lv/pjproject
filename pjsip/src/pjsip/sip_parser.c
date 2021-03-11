@@ -17,6 +17,12 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA 
  */
+
+
+/*当transport接收到一个sip message的时候，就会发给parser进行语法错误的检查，如果通过了就会发给endpoint进行处理*/
+
+
+
 #include <pjsip/sip_parser.h>
 #include <pjsip/sip_uri.h>
 #include <pjsip/sip_msg.h>
@@ -809,6 +815,8 @@ PJ_DEF(pjsip_msg*) pjsip_parse_msg( pj_pool_t *pool,
     return msg;
 }
 
+
+/*处理sip message的语法错误，返回一个sip message*/
 /* Public function to parse as rdata.*/
 PJ_DEF(pjsip_msg *) pjsip_parse_rdata( char *buf, pj_size_t size,
                                        pjsip_rx_data *rdata )
@@ -1009,6 +1017,7 @@ static pj_bool_t is_next_sip_version(pj_scanner *scanner)
     return c && (c=='/' || c==' ' || c=='\t') && pj_stricmp(&sip, &SIP)==0;
 }
 
+/*用来处理sip message的函数*/
 /* Internal function to parse SIP message */
 static pjsip_msg *int_parse_msg( pjsip_parse_ctx *ctx,
 				 pjsip_parser_err_report *err_list)
