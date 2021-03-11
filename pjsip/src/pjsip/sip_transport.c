@@ -2052,7 +2052,7 @@ PJ_DEF(pj_ssize_t) pjsip_tpmgr_receive_packet( pjsip_tpmgr *mgr,
 	    pjsip_parser_err_report *err;
 	    char buf[256];
 	    pj_str_t tmp;
-
+            PJ_LOG(1, ("Martin:", "The sip message got a syntax problem!...from:sip_transport.c:pjsip_tpmgr_receive_packet()"));
 	    /* Gather syntax error information */
 	    tmp.ptr = buf; tmp.slen = 0;
 	    err = rdata->msg_info.parse_err.next;
