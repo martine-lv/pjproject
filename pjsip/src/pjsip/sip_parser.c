@@ -821,6 +821,7 @@ PJ_DEF(pjsip_msg*) pjsip_parse_msg( pj_pool_t *pool,
 PJ_DEF(pjsip_msg *) pjsip_parse_rdata( char *buf, pj_size_t size,
                                        pjsip_rx_data *rdata )
 {
+    PJ_LOG(1, ("Martin:", "Start check syntax problem of the sip message!...from:sip_parser.c:pjsip_parse_rdata()"));
     pj_scanner scanner;
     pjsip_parse_ctx context;
 
@@ -1017,7 +1018,7 @@ static pj_bool_t is_next_sip_version(pj_scanner *scanner)
     return c && (c=='/' || c==' ' || c=='\t') && pj_stricmp(&sip, &SIP)==0;
 }
 
-/*用来处理sip message的函数*/
+/*检查sip message语法是否正确的函数*/
 /* Internal function to parse SIP message */
 static pjsip_msg *int_parse_msg( pjsip_parse_ctx *ctx,
 				 pjsip_parser_err_report *err_list)
