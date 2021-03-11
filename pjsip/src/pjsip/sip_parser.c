@@ -832,6 +832,7 @@ PJ_DEF(pjsip_msg *) pjsip_parse_rdata( char *buf, pj_size_t size,
     context.pool = rdata->tp_info.pool;
     context.rdata = rdata;
 
+    /*调用int_parse_msg()函数进行sip message的语法检查*/
     rdata->msg_info.msg = int_parse_msg(&context, &rdata->msg_info.parse_err);
 
     pj_scan_fini(&scanner);
@@ -1018,11 +1019,13 @@ static pj_bool_t is_next_sip_version(pj_scanner *scanner)
     return c && (c=='/' || c==' ' || c=='\t') && pj_stricmp(&sip, &SIP)==0;
 }
 
+/*Martin 2021-03-11*/
 /*检查sip message语法是否正确的函数*/
 /* Internal function to parse SIP message */
 static pjsip_msg *int_parse_msg( pjsip_parse_ctx *ctx,
 				 pjsip_parser_err_report *err_list)
 {
+     PJ_LOG(1, ("Martin:", "Call function:int_parse_msg()to check the syntax!...from:sip_parser.c:int_parse_msg()"));
     /* These variables require "volatile" so their values get
      * preserved when re-entering the PJ_TRY block after an error.
      */
@@ -1334,6 +1337,7 @@ static void int_parse_hparam( pj_scanner *scanner, pj_pool_t *pool,
  */
 static void int_parse_host(pj_scanner *scanner, pj_str_t *host)
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field : host !...from:sip_parser.c:int_parse_msg()"));
     if (*scanner->curptr == '[') {
 	/* Note: the '[' and ']' characters are removed from the host */
 	pj_scan_get_char(scanner);
@@ -1665,6 +1669,7 @@ static void* int_parse_other_uri(pj_scanner *scanner,
 static void int_parse_req_line( pj_scanner *scanner, pj_pool_t *pool,
 				pjsip_request_line *req_line)
 {
+    PJ_LOG(1, ("Martin:", "check syntax on  request line !...from:sip_parser.c:int_parse_msg()"));
     pj_str_t token;
 
     pj_scan_get( scanner, &pconst.pjsip_TOKEN_SPEC, &token);
@@ -1679,6 +1684,7 @@ static void int_parse_req_line( pj_scanner *scanner, pj_pool_t *pool,
 static void int_parse_status_line( pj_scanner *scanner, 
 				   pjsip_status_line *status_line)
 {
+    PJ_LOG(1, ("Martin:", "check syntax on  status line !...from:sip_parser.c:int_parse_msg()"));
     pj_str_t token;
 
     parse_sip_version(scanner);
@@ -1831,6 +1837,7 @@ static void parse_generic_int_hdr( pjsip_generic_int_hdr *hdr,
 /* Parse Accept header. */
 static pjsip_hdr* parse_hdr_accept(pjsip_parse_ctx *ctx)
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field: Accept !...from:sip_parser.c:int_parse_msg()"));
     pjsip_accept_hdr *accept = pjsip_accept_hdr_create(ctx->pool);
     parse_generic_array_hdr(accept, ctx->scanner);
     return (pjsip_hdr*)accept;
@@ -1839,6 +1846,7 @@ static pjsip_hdr* parse_hdr_accept(pjsip_parse_ctx *ctx)
 /* Parse Allow header. */
 static pjsip_hdr* parse_hdr_allow(pjsip_parse_ctx *ctx)
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field: Allow !...from:sip_parser.c:int_parse_msg()"));
     pjsip_allow_hdr *allow = pjsip_allow_hdr_create(ctx->pool);
     parse_generic_array_hdr(allow, ctx->scanner);
     return (pjsip_hdr*)allow;
@@ -1847,6 +1855,7 @@ static pjsip_hdr* parse_hdr_allow(pjsip_parse_ctx *ctx)
 /* Parse Call-ID header. */
 static pjsip_hdr* parse_hdr_call_id(pjsip_parse_ctx *ctx)
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field: Caller-ID !...from:sip_parser.c:int_parse_msg()"));
     pjsip_cid_hdr *hdr = pjsip_cid_hdr_create(ctx->pool);
     pj_scan_get( ctx->scanner, &pconst.pjsip_NOT_NEWLINE, &hdr->id);
     parse_hdr_end(ctx->scanner);
@@ -1914,6 +1923,7 @@ static void int_parse_contact_param( pjsip_contact_hdr *hdr,
 /* Parse Contact header. */
 static pjsip_hdr* parse_hdr_contact( pjsip_parse_ctx *ctx )
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field: Contact !...from:sip_parser.c:int_parse_msg()"));
     pjsip_contact_hdr *first = NULL;
     pj_scanner *scanner = ctx->scanner;
     
@@ -1952,6 +1962,7 @@ static pjsip_hdr* parse_hdr_contact( pjsip_parse_ctx *ctx )
 /* Parse Content-Length header. */
 static pjsip_hdr* parse_hdr_content_len( pjsip_parse_ctx *ctx )
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field: Content-Length !...from:sip_parser.c:int_parse_msg()"));
     pj_str_t digit;
     pjsip_clen_hdr *hdr;
 
@@ -1969,6 +1980,7 @@ static pjsip_hdr* parse_hdr_content_len( pjsip_parse_ctx *ctx )
 /* Parse Content-Type header. */
 static pjsip_hdr* parse_hdr_content_type( pjsip_parse_ctx *ctx )
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field: Content-Type !...from:sip_parser.c:int_parse_msg()"));
     pjsip_ctype_hdr *hdr;
     pj_scanner *scanner = ctx->scanner;
 
@@ -1997,6 +2009,7 @@ static pjsip_hdr* parse_hdr_content_type( pjsip_parse_ctx *ctx )
 /* Parse CSeq header. */
 static pjsip_hdr* parse_hdr_cseq( pjsip_parse_ctx *ctx )
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field: Cseq !...from:sip_parser.c:int_parse_msg()"));
     pj_str_t cseq, method;
     pjsip_cseq_hdr *hdr = NULL;
     int cseq_val = 0;
@@ -2021,6 +2034,7 @@ static pjsip_hdr* parse_hdr_cseq( pjsip_parse_ctx *ctx )
 /* Parse Expires header. */
 static pjsip_hdr* parse_hdr_expires(pjsip_parse_ctx *ctx)
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field: Expires !...from:sip_parser.c:int_parse_msg()"));
     pjsip_expires_hdr *hdr = pjsip_expires_hdr_create(ctx->pool, 0);
     parse_generic_int_hdr(hdr, ctx->scanner);
     return (pjsip_hdr*)hdr;
@@ -2031,6 +2045,7 @@ static void parse_hdr_fromto( pj_scanner *scanner,
 			      pj_pool_t *pool, 
 			      pjsip_from_hdr *hdr)
 {
+    PJ_LOG(1, ("Martin:", "check syntax on header field: From or To !...from:sip_parser.c:int_parse_msg()"));
     hdr->uri = int_parse_uri_or_name_addr(scanner, pool, 
 					  PJSIP_PARSE_URI_AS_NAMEADDR |
 					  PJSIP_PARSE_URI_IN_FROM_TO_HDR);
