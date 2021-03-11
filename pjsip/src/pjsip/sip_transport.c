@@ -1935,7 +1935,8 @@ PJ_DEF(pj_status_t) pjsip_tpmgr_destroy( pjsip_tpmgr *mgr )
     return PJ_SUCCESS;
 }
 
-
+/*Martin 2021-03-11*/
+/*当收到一个sip message的时候，transport调用pjsip_tpmgr_receive_packet()函数进行处理*/
 /*
  * pjsip_tpmgr_receive_packet()
  *
@@ -1944,6 +1945,7 @@ PJ_DEF(pj_status_t) pjsip_tpmgr_destroy( pjsip_tpmgr *mgr )
 PJ_DEF(pj_ssize_t) pjsip_tpmgr_receive_packet( pjsip_tpmgr *mgr,
 					       pjsip_rx_data *rdata)
 {
+    /*tp_info.transport就是接收到这个sip message的那个transport*/
     pjsip_transport *tr = rdata->tp_info.transport;
 
     char *current_pkt;
