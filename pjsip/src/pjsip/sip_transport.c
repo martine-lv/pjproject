@@ -1946,6 +1946,7 @@ PJ_DEF(pj_ssize_t) pjsip_tpmgr_receive_packet( pjsip_tpmgr *mgr,
 					       pjsip_rx_data *rdata)
 {
     /*tp_info.transport就是接收到这个sip message的那个transport*/
+    PJ_LOG(1, ("Martin:", "You got a new sip message!...from:sip_transport.c:pjsip_tpmgr_receive_packet()"));
     pjsip_transport *tr = rdata->tp_info.transport;
 
     char *current_pkt;
@@ -2052,6 +2053,8 @@ PJ_DEF(pj_ssize_t) pjsip_tpmgr_receive_packet( pjsip_tpmgr *mgr,
 	saved = current_pkt[msg_fragment_size];
 	current_pkt[msg_fragment_size] = '\0';
 
+	/*Martin 2021-03-11*/
+	/*调用pjsip_parse_rdata对sip消息的语法问题进行检查*/
 	/* Parse the message. */
 	rdata->msg_info.msg = msg = 
 	    pjsip_parse_rdata( current_pkt, msg_fragment_size, rdata);
@@ -2069,6 +2072,7 @@ PJ_DEF(pj_ssize_t) pjsip_tpmgr_receive_packet( pjsip_tpmgr *mgr,
 	    tmp.ptr = buf; tmp.slen = 0;
 	    err = rdata->msg_info.parse_err.next;
 	    while (err != &rdata->msg_info.parse_err) {
+		PJ_LOG(1, ("Martin:", "A syntax problem occured!...from:sip_transport.c:pjsip_tpmgr_receive_packet()"));
 		int len;
 		len = pj_ansi_snprintf(tmp.ptr+tmp.slen, sizeof(buf)-tmp.slen,
 				       ": %s exception when parsing '%.*s' "
