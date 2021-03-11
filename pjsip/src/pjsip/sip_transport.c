@@ -1929,7 +1929,7 @@ PJ_DEF(pj_status_t) pjsip_tpmgr_destroy( pjsip_tpmgr *mgr )
 PJ_DEF(pj_ssize_t) pjsip_tpmgr_receive_packet( pjsip_tpmgr *mgr,
 					       pjsip_rx_data *rdata)
 {
-	/*tp_info.transport就是接收到这个sip message的那个transport*/
+    /*tp_info.transport就是接收到这个sip message的那个transport*/
     PJ_LOG(1, ("Martin:", "You got a new sip message!...from:sip_transport.c:pjsip_tpmgr_receive_packet()"));
     pjsip_transport *tr = rdata->tp_info.transport;
     
@@ -1961,6 +1961,7 @@ PJ_DEF(pj_ssize_t) pjsip_tpmgr_receive_packet( pjsip_tpmgr *mgr,
 	char saved;
 	pj_size_t msg_fragment_size;
 
+	/*newlines就是换行，/n这种，要去掉，函数处理不了*/
 	/* Skip leading newlines as pjsip_find_msg() currently can't
 	 * handle leading newlines.
 	 */
