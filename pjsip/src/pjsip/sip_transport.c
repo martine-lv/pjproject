@@ -17,2515 +17,2704 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA 
  */
-
-
-/*当transport接收到一个sip message的时候，就会发给parser进行语法错误的检查，如果通过了就会发给endpoint进行处理*/
-
-
-
+#include <pjsip/sip_transport.h>
+#include <pjsip/sip_endpoint.h>
 #include <pjsip/sip_parser.h>
-#include <pjsip/sip_uri.h>
 #include <pjsip/sip_msg.h>
-#include <pjsip/sip_multipart.h>
-#include <pjsip/sip_auth_parser.h>
+#include <pjsip/sip_private.h>
 #include <pjsip/sip_errno.h>
-#include <pjsip/sip_transport.h>        /* rdata structure */
-#include <pjlib-util/scanner.h>
-#include <pjlib-util/string.h>
+#include <pjsip/sip_module.h>
+#include <pj/addr_resolv.h>
 #include <pj/except.h>
-#include <pj/log.h>
-#include <pj/hash.h>
 #include <pj/os.h>
-#include <pj/pool.h>
+#include <pj/log.h>
+#include <pj/ioqueue.h>
+#include <pj/hash.h>
 #include <pj/string.h>
-#include <pj/ctype.h>
+#include <pj/pool.h>
 #include <pj/assert.h>
-#include <pj/limits.h>
+#include <pj/lock.h>
+#include <pj/list.h>
 
-#define THIS_FILE	    "sip_parser.c"
 
-#define ALNUM
-#define RESERVED	    ";/?:@&=+$,"
-#define MARK		    "-_.!~*'()"
-#define UNRESERVED	    ALNUM MARK
-#define ESCAPED		    "%"
-#define USER_UNRESERVED	    "&=+$,;?/"
-#define PASS		    "&=+$,"
-#define TOKEN		    "-.!%*_`'~+"   /* '=' was removed for parsing 
-					    * param */
-#define HOST		    "_-."
-#define HEX_DIGIT	    "abcdefABCDEF"
-#define PARAM_CHAR	    "[]/:&+$" UNRESERVED ESCAPED
-#define HNV_UNRESERVED	    "[]/?:+$"
-#define HDR_CHAR	    HNV_UNRESERVED UNRESERVED ESCAPED
+#define THIS_FILE    "sip_transport.c"
 
-/* A generic URI can consist of (For a complete BNF see RFC 2396):
-     #?;:@&=+-_.!~*'()%$,/
- */
-#define GENERIC_URI_CHARS   "#?;:@&=+-_.!~*'()%$,/" "%"
+#if 0
+#   define TRACE_(x)	PJ_LOG(5,x)
 
-#define UNREACHED(expr)
-
-#define IS_NEWLINE(c)	((c)=='\r' || (c)=='\n')
-#define IS_SPACE(c)	((c)==' ' || (c)=='\t')
-
-/*
- * Header parser records.
- */
-typedef struct handler_rec
+static const char *addr_string(const pj_sockaddr_t *addr)
 {
-    char		  hname[PJSIP_MAX_HNAME_LEN+1];
-    pj_size_t		  hname_len;
-    pj_uint32_t		  hname_hash;
-    pjsip_parse_hdr_func *handler;
-} handler_rec;
-
-static handler_rec handler[PJSIP_MAX_HEADER_TYPES];
-static unsigned handler_count;
-static int parser_is_initialized;
-
-/*
- * URI parser records.
- */
-typedef struct uri_parser_rec
+    static char str[PJ_INET6_ADDRSTRLEN];
+    pj_inet_ntop(((const pj_sockaddr*)addr)->addr.sa_family, 
+		 pj_sockaddr_get_addr(addr),
+		 str, sizeof(str));
+    return str;
+}
+static const char* print_tpsel_info(const pjsip_tpselector *sel)
 {
-    pj_str_t		     scheme;
-    pjsip_parse_uri_func    *parse;
-} uri_parser_rec;
+    static char tpsel_info_buf[80];
+    if (!sel) return "(null)";
+    if (sel->type==PJSIP_TPSELECTOR_LISTENER)
+	pj_ansi_snprintf(tpsel_info_buf, sizeof(tpsel_info_buf),
+			 "listener[%s], reuse=%d", sel->u.listener->obj_name,
+			 !sel->disable_connection_reuse);
+    else if (sel->type==PJSIP_TPSELECTOR_TRANSPORT)
+	pj_ansi_snprintf(tpsel_info_buf, sizeof(tpsel_info_buf),
+			 "transport[%s], reuse=%d", sel->u.transport->info,
+			 !sel->disable_connection_reuse);
+    else
+	pj_ansi_snprintf(tpsel_info_buf, sizeof(tpsel_info_buf),
+			 "unknown[%p], reuse=%d", sel->u.ptr,
+			 !sel->disable_connection_reuse);
+    return tpsel_info_buf;
+}
+#else
+#   define TRACE_(x)
+#endif
 
-static uri_parser_rec uri_handler[PJSIP_MAX_URI_TYPES];
-static unsigned uri_handler_count;
+/* Specify the initial size of the transport manager's pool. */
+#ifndef  TPMGR_POOL_INIT_SIZE
+#   define TPMGR_POOL_INIT_SIZE	64
+#endif
 
-/*
- * Global vars (also extern).
+/* Specify the increment size of the transport manager's pool. */
+#ifndef TPMGR_POOL_INC_SIZE
+    #define TPMGR_POOL_INC_SIZE	64
+#endif
+
+/* Specify transport entry allocation count. When registering a new transport,
+ * a new entry will be picked from a free list. This setting will determine
+ * the size of the free list size. If all entry is used, then the same number
+ * of entry will be allocated.
  */
-int PJSIP_SYN_ERR_EXCEPTION = -1;
-int PJSIP_EINVAL_ERR_EXCEPTION = -2;
+#ifndef PJSIP_TRANSPORT_ENTRY_ALLOC_CNT
+#   define PJSIP_TRANSPORT_ENTRY_ALLOC_CNT  16
+#endif
 
-/* Parser constants */
-static pjsip_parser_const_t pconst =
+/* Prototype. */
+static pj_status_t mod_on_tx_msg(pjsip_tx_data *tdata);
+
+/* This module has sole purpose to print transmit data to contigous buffer
+ * before actually transmitted to the wire. 
+ */
+static pjsip_module mod_msg_print = 
 {
-    { "user", 4},	/* pjsip_USER_STR	*/
-    { "method", 6},	/* pjsip_METHOD_STR	*/
-    { "transport", 9},	/* pjsip_TRANSPORT_STR	*/
-    { "maddr", 5 },	/* pjsip_MADDR_STR	*/
-    { "lr", 2 },	/* pjsip_LR_STR		*/
-    { "sip", 3 },	/* pjsip_SIP_STR	*/
-    { "sips", 4 },	/* pjsip_SIPS_STR	*/
-    { "tel", 3 },	/* pjsip_TEL_STR	*/
-    { "branch", 6 },	/* pjsip_BRANCH_STR	*/
-    { "ttl", 3 },	/* pjsip_TTL_STR	*/
-    { "received", 8 },	/* pjsip_RECEIVED_STR	*/
-    { "q", 1 },		/* pjsip_Q_STR		*/
-    { "expires", 7 },	/* pjsip_EXPIRES_STR	*/
-    { "tag", 3 },	/* pjsip_TAG_STR	*/
-    { "rport", 5}	/* pjsip_RPORT_STR	*/
+    NULL, NULL,				/* prev and next		    */
+    { "mod-msg-print", 13},		/* Name.			    */
+    -1,					/* Id				    */
+    PJSIP_MOD_PRIORITY_TRANSPORT_LAYER,	/* Priority			    */
+    NULL,				/* load()			    */
+    NULL,				/* start()			    */
+    NULL,				/* stop()			    */
+    NULL,				/* unload()			    */
+    NULL,				/* on_rx_request()		    */
+    NULL,				/* on_rx_response()		    */
+    &mod_on_tx_msg,			/* on_tx_request()		    */
+    &mod_on_tx_msg,			/* on_tx_response()		    */
+    NULL,				/* on_tsx_state()		    */
 };
 
-/* Character Input Specification buffer. */
-static pj_cis_buf_t cis_buf;
+/* Transport list item */
+typedef struct transport
+{
+    PJ_DECL_LIST_MEMBER(struct transport);
+    pj_hash_entry_buf tp_buf;
+    pjsip_transport *tp;
+} transport;
+
+/*
+ * Transport manager.
+ */
+struct pjsip_tpmgr 
+{
+    pj_hash_table_t *table;
+    pj_lock_t	    *lock;
+    pjsip_endpoint  *endpt;
+    pjsip_tpfactory  factory_list;
+    pj_pool_t	    *pool;
+#if defined(PJ_DEBUG) && PJ_DEBUG!=0
+    pj_atomic_t	    *tdata_counter;
+#endif
+    void           (*on_rx_msg)(pjsip_endpoint*, pj_status_t, pjsip_rx_data*);
+    pj_status_t	   (*on_tx_msg)(pjsip_endpoint*, pjsip_tx_data*);
+    pjsip_tp_state_callback tp_state_cb;
+    pjsip_tp_on_rx_dropped_cb tp_drop_data_cb;
+
+    /* Transmit data list, for transmit data cleanup when transport manager
+     * is destroyed.
+     */
+    pjsip_tx_data    tdata_list;
+
+    /* List of free transport entry. */
+    transport	     tp_entry_freelist;
+};
+
+
+/* Transport state listener list type */
+typedef struct tp_state_listener
+{
+    PJ_DECL_LIST_MEMBER(struct tp_state_listener);
+
+    pjsip_tp_state_callback  cb;
+    void *user_data;
+} tp_state_listener;
 
 
 /*
- * Forward decl.
+ * Transport data.
  */
-static pjsip_msg *  int_parse_msg( pjsip_parse_ctx *ctx, 
-				   pjsip_parser_err_report *err_list);
-static void	    int_parse_param( pj_scanner *scanner, 
-				     pj_pool_t *pool,
-				     pj_str_t *pname, 
-				     pj_str_t *pvalue,
-				     unsigned option);
-static void	    int_parse_uri_param( pj_scanner *scanner, 
-					 pj_pool_t *pool,
-					 pj_str_t *pname, 
-					 pj_str_t *pvalue,
-					 unsigned option);
-static void	    int_parse_hparam( pj_scanner *scanner,
-				      pj_pool_t *pool,
-				      pj_str_t *hname,
-				      pj_str_t *hvalue );
-static void         int_parse_req_line( pj_scanner *scanner, 
-					pj_pool_t *pool,
-					pjsip_request_line *req_line);
-static int          int_is_next_user( pj_scanner *scanner);
-static void	    int_parse_status_line( pj_scanner *scanner, 
-					   pjsip_status_line *line);
-static void	    int_parse_user_pass( pj_scanner *scanner, 
-					 pj_pool_t *pool,
-					 pj_str_t *user, 
-					 pj_str_t *pass);
-static void	    int_parse_uri_host_port( pj_scanner *scanner, 
-					     pj_str_t *p_host, 
-					     int *p_port);
-static pjsip_uri *  int_parse_uri_or_name_addr( pj_scanner *scanner, 
-					        pj_pool_t *pool, 
-                                                unsigned option);
-static void*	    int_parse_sip_url( pj_scanner *scanner, 
-				         pj_pool_t *pool,
-				         pj_bool_t parse_params);
-static pjsip_name_addr *
-                    int_parse_name_addr( pj_scanner *scanner, 
-					 pj_pool_t *pool );
-static void*	    int_parse_other_uri(pj_scanner *scanner, 
-					pj_pool_t *pool,
-					pj_bool_t parse_params);
-static void	    parse_hdr_end( pj_scanner *scanner );
-
-static pjsip_hdr*   parse_hdr_accept( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_allow( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_call_id( pjsip_parse_ctx *ctx);
-static pjsip_hdr*   parse_hdr_contact( pjsip_parse_ctx *ctx);
-static pjsip_hdr*   parse_hdr_content_len( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_content_type( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_cseq( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_expires( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_from( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_max_forwards( pjsip_parse_ctx *ctx);
-static pjsip_hdr*   parse_hdr_min_expires( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_rr( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_route( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_require( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_retry_after( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_supported( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_to( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_unsupported( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_via( pjsip_parse_ctx *ctx );
-static pjsip_hdr*   parse_hdr_generic_string( pjsip_parse_ctx *ctx);
-
-/* Convert non NULL terminated string to integer. */
-static unsigned long pj_strtoul_mindigit(const pj_str_t *str, 
-                                         unsigned mindig)
+typedef struct transport_data
 {
-    unsigned long value;
+    /* Transport listeners */
+    tp_state_listener	    st_listeners;
+    tp_state_listener	    st_listeners_empty;
+} transport_data;
+
+
+/*****************************************************************************
+ *
+ * GENERAL TRANSPORT (NAMES, TYPES, ETC.)
+ *
+ *****************************************************************************/
+
+/*
+ * Transport names.
+ */
+static struct transport_names_t
+{
+    pjsip_transport_type_e type;	    /* Transport type	    */
+    pj_uint16_t		   port;	    /* Default port number  */
+    pj_str_t		   name;	    /* Id tag		    */
+    const char		  *description;	    /* Longer description   */
+    unsigned		   flag;	    /* Flags		    */
+    char		   name_buf[16];    /* For user's transport */
+} transport_names[16] = 
+{
+    { 
+	PJSIP_TRANSPORT_UNSPECIFIED, 
+	0, 
+	{"Unspecified", 11}, 
+	"Unspecified", 
+	0
+    },
+    { 
+	PJSIP_TRANSPORT_UDP, 
+	5060, 
+	{"UDP", 3}, 
+	"UDP transport", 
+	PJSIP_TRANSPORT_DATAGRAM
+    },
+    { 
+	PJSIP_TRANSPORT_TCP, 
+	5060, 
+	{"TCP", 3}, 
+	"TCP transport", 
+	PJSIP_TRANSPORT_RELIABLE
+    },
+    { 
+	PJSIP_TRANSPORT_TLS, 
+	5061, 
+	{"TLS", 3}, 
+	"TLS transport", 
+	PJSIP_TRANSPORT_RELIABLE | PJSIP_TRANSPORT_SECURE
+    },
+    { 
+	PJSIP_TRANSPORT_DTLS,
+	5061, 
+	{"DTLS", 4}, 
+	"DTLS transport", 
+	PJSIP_TRANSPORT_SECURE
+    },
+    { 
+	PJSIP_TRANSPORT_SCTP, 
+	5060, 
+	{"SCTP", 4}, 
+	"SCTP transport", 
+	PJSIP_TRANSPORT_RELIABLE
+    },
+    { 
+	PJSIP_TRANSPORT_LOOP, 
+	15060, 
+	{"LOOP", 4}, 
+	"Loopback transport", 
+	PJSIP_TRANSPORT_RELIABLE
+    }, 
+    { 
+	PJSIP_TRANSPORT_LOOP_DGRAM, 
+	15060, 
+	{"LOOP-DGRAM", 10}, 
+	"Loopback datagram transport", 
+	PJSIP_TRANSPORT_DATAGRAM
+    },
+    { 
+	PJSIP_TRANSPORT_UDP6, 
+	5060, 
+	{"UDP", 3}, 
+	"UDP IPv6 transport", 
+	PJSIP_TRANSPORT_DATAGRAM
+    },
+    { 
+	PJSIP_TRANSPORT_TCP6, 
+	5060, 
+	{"TCP", 3}, 
+	"TCP IPv6 transport", 
+	PJSIP_TRANSPORT_RELIABLE
+    },
+    {
+	PJSIP_TRANSPORT_TLS6,
+	5061,
+	{"TLS", 3},
+	"TLS IPv6 transport",
+	PJSIP_TRANSPORT_RELIABLE | PJSIP_TRANSPORT_SECURE
+    },
+    {
+	PJSIP_TRANSPORT_DTLS6,
+	5061,
+	{"DTLS", 4},
+	"DTLS IPv6 transport",
+	PJSIP_TRANSPORT_SECURE
+    },
+};
+
+static void tp_state_callback(pjsip_transport *tp,
+			      pjsip_transport_state state,
+			      const pjsip_transport_state_info *info);
+
+
+static struct transport_names_t *get_tpname(pjsip_transport_type_e type)
+{
+    unsigned i;
+    for (i=0; i<PJ_ARRAY_SIZE(transport_names); ++i) {
+	if (transport_names[i].type == type)
+	    return &transport_names[i];
+    }
+    pj_assert(!"Invalid transport type!");
+    return NULL;
+}
+
+
+
+/*
+ * Register new transport type to PJSIP.
+ */
+PJ_DEF(pj_status_t) pjsip_transport_register_type( unsigned tp_flag,
+						   const char *tp_name,
+						   int def_port,
+						   int *p_tp_type)
+{
+    unsigned i;
+    pjsip_transport_type_e parent = 0;
+
+    PJ_ASSERT_RETURN(tp_flag && tp_name && def_port, PJ_EINVAL);
+    PJ_ASSERT_RETURN(pj_ansi_strlen(tp_name) < 
+			PJ_ARRAY_SIZE(transport_names[0].name_buf), 
+		     PJ_ENAMETOOLONG);
+
+    for (i=1; i<PJ_ARRAY_SIZE(transport_names); ++i) {
+        if (tp_flag & PJSIP_TRANSPORT_IPV6 && 
+            pj_stricmp2(&transport_names[i].name, tp_name) == 0)
+        {
+	    parent = transport_names[i].type;
+        }
+	if (transport_names[i].type == 0)
+	    break;
+    }
+
+    if (i == PJ_ARRAY_SIZE(transport_names))
+	return PJ_ETOOMANY;
+
+    if (tp_flag & PJSIP_TRANSPORT_IPV6 && parent) {
+        transport_names[i].type = parent | PJSIP_TRANSPORT_IPV6;
+    } else {
+        transport_names[i].type = (pjsip_transport_type_e)i;
+    }
+
+    transport_names[i].port = (pj_uint16_t)def_port;
+    pj_ansi_strcpy(transport_names[i].name_buf, tp_name);
+    transport_names[i].name = pj_str(transport_names[i].name_buf);
+    transport_names[i].flag = tp_flag;
+
+    if (p_tp_type)
+	*p_tp_type = transport_names[i].type;
+
+    return PJ_SUCCESS;
+}
+
+
+/*
+ * Get transport type from name.
+ */
+PJ_DEF(pjsip_transport_type_e) pjsip_transport_get_type_from_name(const pj_str_t *name)
+{
     unsigned i;
 
-    value = 0;
-    for (i=0; i<(unsigned)str->slen; ++i) {
-	value = value * 10 + (str->ptr[i] - '0');
+    if (name->slen == 0)
+	return PJSIP_TRANSPORT_UNSPECIFIED;
+
+    /* Get transport type from name. */
+    for (i=0; i<PJ_ARRAY_SIZE(transport_names); ++i) {
+	if (pj_stricmp(name, &transport_names[i].name) == 0) {
+	    return transport_names[i].type;
+	}
     }
-    for (; i<mindig; ++i) {
-	value = value * 10;
-    }
-    return value;
+
+    pj_assert(!"Invalid transport name");
+    return PJSIP_TRANSPORT_UNSPECIFIED;
 }
 
-/* Case insensitive comparison */
-#define parser_stricmp(s1, s2)  (s1.slen!=s2.slen || pj_stricmp_alnum(&s1, &s2))
 
-/* Get a token and unescape */
-PJ_INLINE(void) parser_get_and_unescape(pj_scanner *scanner, pj_pool_t *pool,
-					const pj_cis_t *spec, 
-					const pj_cis_t *unesc_spec,
-					pj_str_t *token)
+/*
+ * Get the transport type for the specified flags.
+ */
+PJ_DEF(pjsip_transport_type_e) pjsip_transport_get_type_from_flag(unsigned flag)
 {
-#if defined(PJSIP_UNESCAPE_IN_PLACE) && PJSIP_UNESCAPE_IN_PLACE!=0
-    PJ_UNUSED_ARG(pool);
-    PJ_UNUSED_ARG(spec);
-    pj_scan_get_unescape(scanner, unesc_spec, token);
-#else
-    PJ_UNUSED_ARG(unesc_spec);
-    pj_scan_get(scanner, spec, token);
-    *token = pj_str_unescape(pool, token);
+    unsigned i;
+
+    /* Get the transport type for the specified flags. */
+    for (i=0; i<PJ_ARRAY_SIZE(transport_names); ++i) {
+	if (transport_names[i].flag == flag) {
+	    return transport_names[i].type;
+	}
+    }
+
+    pj_assert(!"Invalid transport type");
+    return PJSIP_TRANSPORT_UNSPECIFIED;
+}
+
+/*
+ * Get the socket address family of a given transport type.
+ */
+PJ_DEF(int) pjsip_transport_type_get_af(pjsip_transport_type_e type)
+{
+    if (type & PJSIP_TRANSPORT_IPV6)
+	return pj_AF_INET6();
+    else
+	return pj_AF_INET();
+}
+
+PJ_DEF(unsigned) pjsip_transport_get_flag_from_type(pjsip_transport_type_e type)
+{
+    /* Return transport flag. */
+    return get_tpname(type)->flag;
+}
+
+/*
+ * Get the default SIP port number for the specified type.
+ */
+PJ_DEF(int) pjsip_transport_get_default_port_for_type(pjsip_transport_type_e type)
+{
+    /* Return the port. */
+    return get_tpname(type)->port;
+}
+
+/*
+ * Get transport name.
+ */
+PJ_DEF(const char*) pjsip_transport_get_type_name(pjsip_transport_type_e type)
+{
+    /* Return the name. */
+    return get_tpname(type)->name.ptr;
+}
+
+/*
+ * Get transport description.
+ */
+PJ_DEF(const char*) pjsip_transport_get_type_desc(pjsip_transport_type_e type)
+{
+    /* Return the description. */
+    return get_tpname(type)->description;
+}
+
+
+/*****************************************************************************
+ *
+ * TRANSPORT SELECTOR
+ *
+ *****************************************************************************/
+
+/*
+ * Add transport/listener reference in the selector.
+ */
+PJ_DEF(void) pjsip_tpselector_add_ref(pjsip_tpselector *sel)
+{
+    if (sel->type == PJSIP_TPSELECTOR_TRANSPORT && sel->u.transport != NULL)
+	pjsip_transport_add_ref(sel->u.transport);
+    else if (sel->type == PJSIP_TPSELECTOR_LISTENER && sel->u.listener != NULL)
+	; /* Hmm.. looks like we don't have reference counter for listener */
+}
+
+
+/*
+ * Decrement transport/listener reference in the selector.
+ */
+PJ_DEF(void) pjsip_tpselector_dec_ref(pjsip_tpselector *sel)
+{
+    if (sel->type == PJSIP_TPSELECTOR_TRANSPORT && sel->u.transport != NULL)
+	pjsip_transport_dec_ref(sel->u.transport);
+    else if (sel->type == PJSIP_TPSELECTOR_LISTENER && sel->u.listener != NULL)
+	; /* Hmm.. looks like we don't have reference counter for listener */
+}
+
+
+/*****************************************************************************
+ *
+ * TRANSMIT DATA BUFFER MANIPULATION.
+ *
+ *****************************************************************************/
+
+/*
+ * Create new transmit buffer.
+ */
+PJ_DEF(pj_status_t) pjsip_tx_data_create( pjsip_tpmgr *mgr,
+					  pjsip_tx_data **p_tdata )
+{
+    pj_pool_t *pool;
+    pjsip_tx_data *tdata;
+    pj_status_t status;
+
+    PJ_ASSERT_RETURN(mgr && p_tdata, PJ_EINVAL);
+
+    pool = pjsip_endpt_create_pool( mgr->endpt, "tdta%p",
+				    PJSIP_POOL_LEN_TDATA,
+				    PJSIP_POOL_INC_TDATA );
+    if (!pool)
+	return PJ_ENOMEM;
+
+    tdata = PJ_POOL_ZALLOC_T(pool, pjsip_tx_data);
+    tdata->pool = pool;
+    tdata->mgr = mgr;
+    pj_ansi_snprintf(tdata->obj_name, sizeof(tdata->obj_name), "tdta%p", tdata);
+    pj_memcpy(pool->obj_name, tdata->obj_name, sizeof(pool->obj_name));
+
+    status = pj_atomic_create(tdata->pool, 0, &tdata->ref_cnt);
+    if (status != PJ_SUCCESS) {
+	pjsip_endpt_release_pool( mgr->endpt, tdata->pool );
+	return status;
+    }
+    
+    //status = pj_lock_create_simple_mutex(pool, "tdta%p", &tdata->lock);
+    status = pj_lock_create_null_mutex(pool, "tdta%p", &tdata->lock);
+    if (status != PJ_SUCCESS) {
+	pjsip_endpt_release_pool( mgr->endpt, tdata->pool );
+	return status;
+    }
+
+    pj_ioqueue_op_key_init(&tdata->op_key.key, sizeof(tdata->op_key.key));
+    pj_list_init(tdata);
+
+#if defined(PJSIP_HAS_TX_DATA_LIST) && PJSIP_HAS_TX_DATA_LIST!=0
+    /* Append this just created tdata to transmit buffer list */
+    pj_lock_acquire(mgr->lock);
+    pj_list_push_back(&mgr->tdata_list, tdata);
+    pj_lock_release(mgr->lock);
 #endif
+
+#if defined(PJ_DEBUG) && PJ_DEBUG!=0
+    pj_atomic_inc( tdata->mgr->tdata_counter );
+#endif
+
+    *p_tdata = tdata;
+    return PJ_SUCCESS;
 }
 
-/* Syntax error handler for parser. */
-static void on_syntax_error(pj_scanner *scanner)
+
+/*
+ * Add reference to tx buffer.
+ */
+PJ_DEF(void) pjsip_tx_data_add_ref( pjsip_tx_data *tdata )
 {
-    PJ_UNUSED_ARG(scanner);
-    PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
+    pj_atomic_inc(tdata->ref_cnt);
 }
 
-/* Syntax error handler for parser. */
-static void on_str_parse_error(const pj_str_t *str, int rc)
+static void tx_data_destroy(pjsip_tx_data *tdata)
 {
-    char *s;
+    PJ_LOG(5,(tdata->obj_name, "Destroying txdata %s",
+	      pjsip_tx_data_get_info(tdata)));
+    pjsip_tpselector_dec_ref(&tdata->tp_sel);
+#if defined(PJ_DEBUG) && PJ_DEBUG!=0
+    pj_atomic_dec( tdata->mgr->tdata_counter );
+#endif
 
-    switch(rc) {
-    case PJ_EINVAL:
-        s = "NULL input string, invalid input string, or NULL return "\
-	    "value pointer";
-        break;
-    case PJ_ETOOSMALL:
-        s = "String value was less than the minimum allowed value.";
-        break;
-    case PJ_ETOOBIG:
-        s = "String value was greater than the maximum allowed value.";
-        break;
-    default:
-        s = "Unknown error";
-    }
+#if defined(PJSIP_HAS_TX_DATA_LIST) && PJSIP_HAS_TX_DATA_LIST!=0
+    /* Remove this tdata from transmit buffer list */
+    pj_lock_acquire(tdata->mgr->lock);
+    pj_list_erase(tdata);
+    pj_lock_release(tdata->mgr->lock);
+#endif
 
-    if (str) {
-        PJ_LOG(1, (THIS_FILE, "Error parsing '%.*s': %s",
-                   (int)str->slen, str->ptr, s));
+    pj_atomic_destroy( tdata->ref_cnt );
+    pj_lock_destroy( tdata->lock );
+    pjsip_endpt_release_pool( tdata->mgr->endpt, tdata->pool );
+}
+
+/*
+ * Decrease transport data reference, destroy it when the reference count
+ * reaches zero.
+ */
+PJ_DEF(pj_status_t) pjsip_tx_data_dec_ref( pjsip_tx_data *tdata )
+{
+    pj_atomic_value_t ref_cnt;
+    
+    PJ_ASSERT_RETURN(tdata && tdata->ref_cnt, PJ_EINVAL);
+
+    ref_cnt = pj_atomic_dec_and_get(tdata->ref_cnt);
+    pj_assert( ref_cnt >= 0);
+    if (ref_cnt == 0) {
+	tx_data_destroy(tdata);
+	return PJSIP_EBUFDESTROYED;
     } else {
-        PJ_LOG(1, (THIS_FILE, "Can't parse input string: %s", s));
+	return PJ_SUCCESS;
     }
-    PJ_THROW(PJSIP_EINVAL_ERR_EXCEPTION);
 }
 
-static void strtoi_validate(const pj_str_t *str, int min_val,
-			    int max_val, int *value)
-{ 
-    long retval;
+/*
+ * Invalidate the content of the print buffer to force the message to be
+ * re-printed when sent.
+ */
+PJ_DEF(void) pjsip_tx_data_invalidate_msg( pjsip_tx_data *tdata )
+{
+    tdata->buf.cur = tdata->buf.start;
+    tdata->info = NULL;
+}
+
+/*
+ * Print the SIP message to transmit data buffer's internal buffer.
+ */
+PJ_DEF(pj_status_t) pjsip_tx_data_encode(pjsip_tx_data *tdata)
+{
+    /* Allocate buffer if necessary. */
+    if (tdata->buf.start == NULL) {
+	PJ_USE_EXCEPTION;
+
+	PJ_TRY {
+	    tdata->buf.start = (char*) 
+			       pj_pool_alloc(tdata->pool, PJSIP_MAX_PKT_LEN);
+	}
+	PJ_CATCH_ANY {
+	    return PJ_ENOMEM;
+	}
+	PJ_END
+
+	tdata->buf.cur = tdata->buf.start;
+	tdata->buf.end = tdata->buf.start + PJSIP_MAX_PKT_LEN;
+    }
+
+    /* Do we need to reprint? */
+    if (!pjsip_tx_data_is_valid(tdata)) {
+	pj_ssize_t size;
+
+	size = pjsip_msg_print( tdata->msg, tdata->buf.start, 
+			        tdata->buf.end - tdata->buf.start);
+	if (size < 0) {
+	    return PJSIP_EMSGTOOLONG;
+	}
+	pj_assert(size != 0);
+	tdata->buf.cur[size] = '\0';
+	tdata->buf.cur += size;
+    }
+
+    return PJ_SUCCESS;
+}
+
+PJ_DEF(pj_bool_t) pjsip_tx_data_is_valid( pjsip_tx_data *tdata )
+{
+    return tdata->buf.cur != tdata->buf.start;
+}
+
+static char *get_msg_info(pj_pool_t *pool, const char *obj_name,
+			  const pjsip_msg *msg)
+{
+    char info_buf[128], *info;
+    const pjsip_cseq_hdr *cseq;
+    int len;
+
+    cseq = (const pjsip_cseq_hdr*) pjsip_msg_find_hdr(msg, PJSIP_H_CSEQ, NULL);
+    PJ_ASSERT_RETURN(cseq != NULL, "INVALID MSG");
+
+    if (msg->type == PJSIP_REQUEST_MSG) {
+	len = pj_ansi_snprintf(info_buf, sizeof(info_buf), 
+			       "Request msg %.*s/cseq=%d (%s)",
+			       (int)msg->line.req.method.name.slen,
+			       msg->line.req.method.name.ptr,
+			       cseq->cseq, obj_name);
+    } else {
+	len = pj_ansi_snprintf(info_buf, sizeof(info_buf),
+			       "Response msg %d/%.*s/cseq=%d (%s)",
+			       msg->line.status.code,
+			       (int)cseq->method.name.slen,
+			       cseq->method.name.ptr,
+			       cseq->cseq, obj_name);
+    }
+
+    if (len < 1 || len >= (int)sizeof(info_buf)) {
+	return (char*)obj_name;
+    }
+
+    info = (char*) pj_pool_alloc(pool, len+1);
+    pj_memcpy(info, info_buf, len+1);
+
+    return info;
+}
+
+PJ_DEF(char*) pjsip_tx_data_get_info( pjsip_tx_data *tdata )
+{
+    PJ_ASSERT_RETURN(tdata, "NULL");
+
+    /* tdata->info may be assigned by application so if it exists
+     * just return it.
+     */
+    if (tdata->info)
+	return tdata->info;
+
+    if (tdata->msg==NULL)
+	return "NULL";
+
+    pj_lock_acquire(tdata->lock);
+    tdata->info = get_msg_info(tdata->pool, tdata->obj_name, tdata->msg);
+    pj_lock_release(tdata->lock);
+
+    return tdata->info;
+}
+
+PJ_DEF(pj_status_t) pjsip_tx_data_set_transport(pjsip_tx_data *tdata,
+						const pjsip_tpselector *sel)
+{
+    PJ_ASSERT_RETURN(tdata && sel, PJ_EINVAL);
+
+    pj_lock_acquire(tdata->lock);
+
+    pjsip_tpselector_dec_ref(&tdata->tp_sel);
+
+    pj_memcpy(&tdata->tp_sel, sel, sizeof(*sel));
+    pjsip_tpselector_add_ref(&tdata->tp_sel);
+
+    pj_lock_release(tdata->lock);
+
+    return PJ_SUCCESS;
+}
+
+/* Clone pjsip_tx_data. */
+PJ_DEF(pj_status_t) pjsip_tx_data_clone(const pjsip_tx_data *src,
+                                        unsigned flags,
+				  	pjsip_tx_data ** p_tdata)
+{
+    pjsip_tx_data *dst;
+    const pjsip_hdr *hsrc;
+    pjsip_msg *msg;
     pj_status_t status;
 
-    if (!str || !value) {
-        on_str_parse_error(str, PJ_EINVAL);
-    }
-    status = pj_strtol2(str, &retval);
-    if (status != PJ_EINVAL) {
-	if (min_val > retval) {
-	    *value = min_val;
-	    status = PJ_ETOOSMALL;
-	} else if (retval > max_val) {
-	    *value = max_val;
-	    status = PJ_ETOOBIG;
-	} else
-	    *value = (int)retval;
-    }
+    PJ_UNUSED_ARG(flags);
 
+    status = pjsip_tx_data_create(src->mgr, p_tdata);
     if (status != PJ_SUCCESS)
-	on_str_parse_error(str, status);
-}
+	return status;
 
-/* Get parser constants. */
-PJ_DEF(const pjsip_parser_const_t*) pjsip_parser_const(void)
-{
-    return &pconst;
-}
+    dst = *p_tdata;
 
-/* Concatenate unrecognized params into single string. */
-PJ_DEF(void) pjsip_concat_param_imp(pj_str_t *param, pj_pool_t *pool, 
-			     	    const pj_str_t *pname, 
-				    const pj_str_t *pvalue, 
-                             	    int sepchar)
-{
-    char *new_param, *p;
-    pj_size_t len;
+    msg = pjsip_msg_create(dst->pool, PJSIP_RESPONSE_MSG);
+    dst->msg = msg;
+    pjsip_tx_data_add_ref(dst);
 
-    len = param->slen + pname->slen + pvalue->slen + 3;
-    p = new_param = (char*) pj_pool_alloc(pool, len);
-    
-    if (param->slen) {
-	pj_size_t old_len = param->slen;
-	pj_memcpy(p, param->ptr, old_len);
-	p += old_len;
-    }
-    *p++ = (char)sepchar;
-    pj_memcpy(p, pname->ptr, pname->slen);
-    p += pname->slen;
+    /* Duplicate status line */
+    msg->line.status.code = src->msg->line.status.code;
+    pj_strdup(dst->pool, &msg->line.status.reason,
+	      &src->msg->line.status.reason);
 
-    if (pvalue->slen) {
-	*p++ = '=';
-	pj_memcpy(p, pvalue->ptr, pvalue->slen);
-	p += pvalue->slen;
+    /* Duplicate all headers */
+    hsrc = src->msg->hdr.next;
+    while (hsrc != &src->msg->hdr) {
+	pjsip_hdr *h = (pjsip_hdr*) pjsip_hdr_clone(dst->pool, hsrc);
+	pjsip_msg_add_hdr(msg, h);
+	hsrc = hsrc->next;
     }
 
-    *p = '\0';
-    
-    param->ptr = new_param;
-    param->slen = p - new_param;
+    /* Duplicate message body */
+    if (src->msg->body)
+	msg->body = pjsip_msg_body_clone(dst->pool, src->msg->body);
+
+    dst->is_pending = src->is_pending;
+
+    PJ_LOG(5,(THIS_FILE,
+	     "Tx data %s cloned",
+	     pjsip_tx_data_get_info(dst)));
+
+    return PJ_SUCCESS;
 }
 
-/* Initialize static properties of the parser. */
-static pj_status_t init_parser()
+PJ_DEF(char*) pjsip_rx_data_get_info(pjsip_rx_data *rdata)
+{
+    char obj_name[PJ_MAX_OBJ_NAME];
+
+    PJ_ASSERT_RETURN(rdata->msg_info.msg, "INVALID MSG");
+
+    if (rdata->msg_info.info)
+	return rdata->msg_info.info;
+
+    pj_ansi_strcpy(obj_name, "rdata");
+    pj_ansi_snprintf(obj_name+5, sizeof(obj_name)-5, "%p", rdata);
+
+    rdata->msg_info.info = get_msg_info(rdata->tp_info.pool, obj_name,
+					rdata->msg_info.msg);
+    return rdata->msg_info.info;
+}
+
+/* Clone pjsip_rx_data. */
+PJ_DEF(pj_status_t) pjsip_rx_data_clone( const pjsip_rx_data *src,
+                                         unsigned flags,
+                                         pjsip_rx_data **p_rdata)
+{
+    pj_pool_t *pool;
+    pjsip_rx_data *dst;
+    pjsip_hdr *hdr;
+
+    PJ_ASSERT_RETURN(src && flags==0 && p_rdata, PJ_EINVAL);
+
+    pool = pj_pool_create(src->tp_info.pool->factory,
+                          "rtd%p",
+                          PJSIP_POOL_RDATA_LEN,
+                          PJSIP_POOL_RDATA_INC,
+                          NULL);
+    if (!pool)
+	return PJ_ENOMEM;
+
+    dst = PJ_POOL_ZALLOC_T(pool, pjsip_rx_data);
+
+    /* Parts of tp_info */
+    dst->tp_info.pool = pool;
+    dst->tp_info.transport = (pjsip_transport*)src->tp_info.transport;
+
+    /* pkt_info can be memcopied */
+    pj_memcpy(&dst->pkt_info, &src->pkt_info, sizeof(src->pkt_info));
+
+    /* msg_info needs deep clone */
+    dst->msg_info.msg_buf = dst->pkt_info.packet +
+			    (src->msg_info.msg_buf - src->pkt_info.packet);
+    dst->msg_info.len = src->msg_info.len;
+    dst->msg_info.msg = pjsip_msg_clone(pool, src->msg_info.msg);
+    pj_list_init(&dst->msg_info.parse_err);
+
+#define GET_MSG_HDR2(TYPE, type, var)	\
+			case PJSIP_H_##TYPE: \
+			    if (!dst->msg_info.var) { \
+				dst->msg_info.var = (pjsip_##type##_hdr*)hdr; \
+			    } \
+			    break
+#define GET_MSG_HDR(TYPE, var_type)	GET_MSG_HDR2(TYPE, var_type, var_type)
+
+    hdr = dst->msg_info.msg->hdr.next;
+    while (hdr != &dst->msg_info.msg->hdr) {
+	switch (hdr->type) {
+	GET_MSG_HDR(CALL_ID, cid);
+	GET_MSG_HDR(FROM, from);
+	GET_MSG_HDR(TO, to);
+	GET_MSG_HDR(VIA, via);
+	GET_MSG_HDR(CSEQ, cseq);
+	GET_MSG_HDR(MAX_FORWARDS, max_fwd);
+	GET_MSG_HDR(ROUTE, route);
+	GET_MSG_HDR2(RECORD_ROUTE, rr, record_route);
+	GET_MSG_HDR(CONTENT_TYPE, ctype);
+	GET_MSG_HDR(CONTENT_LENGTH, clen);
+	GET_MSG_HDR(REQUIRE, require);
+	GET_MSG_HDR(SUPPORTED, supported);
+	default:
+	    break;
+	}
+	hdr = hdr->next;
+    }
+
+#undef GET_MSG_HDR
+#undef GET_MSG_HDR2
+
+    *p_rdata = dst;
+
+    /* Finally add transport ref */
+    return pjsip_transport_add_ref(dst->tp_info.transport);
+}
+
+/* Free previously cloned pjsip_rx_data. */
+PJ_DEF(pj_status_t) pjsip_rx_data_free_cloned(pjsip_rx_data *rdata)
+{
+    PJ_ASSERT_RETURN(rdata, PJ_EINVAL);
+
+    pjsip_transport_dec_ref(rdata->tp_info.transport);
+    pj_pool_release(rdata->tp_info.pool);
+
+    return PJ_SUCCESS;
+}
+
+/*****************************************************************************
+ *
+ * TRANSPORT KEY
+ *
+ *****************************************************************************/
+
+
+/*****************************************************************************
+ *
+ * TRANSPORT
+ *
+ *****************************************************************************/
+
+static void transport_send_callback(pjsip_transport *transport,
+				    void *token,
+				    pj_ssize_t size)
+{
+    pjsip_tx_data *tdata = (pjsip_tx_data*) token;
+
+    PJ_UNUSED_ARG(transport);
+
+    /* Mark pending off so that app can resend/reuse txdata from inside
+     * the callback.
+     */
+    tdata->is_pending = 0;
+
+    /* Call callback, if any. */
+    if (tdata->cb) {
+	(*tdata->cb)(tdata->token, tdata, size);
+    }
+
+    /* Decrement reference count. */
+    pjsip_tx_data_dec_ref(tdata);
+}
+
+/* This function is called by endpoint for on_tx_request() and on_tx_response()
+ * notification.
+ */
+static pj_status_t mod_on_tx_msg(pjsip_tx_data *tdata)
+{
+    return pjsip_tx_data_encode(tdata);
+}
+
+/*
+ * Send a SIP message using the specified transport.
+ */
+PJ_DEF(pj_status_t) pjsip_transport_send(  pjsip_transport *tr, 
+					   pjsip_tx_data *tdata,
+					   const pj_sockaddr_t *addr,
+					   int addr_len,
+					   void *token,
+					   pjsip_tp_send_callback cb)
 {
     pj_status_t status;
 
-    /*
-     * Syntax error exception number.
+    PJ_ASSERT_RETURN(tr && tdata && addr, PJ_EINVAL);
+
+    /* Is it currently being sent? */
+    if (tdata->is_pending) {
+	pj_assert(!"Invalid operation step!");
+	PJ_LOG(2,(THIS_FILE, "Unable to send %s: message is pending", 
+			     pjsip_tx_data_get_info(tdata)));
+	return PJSIP_EPENDINGTX;
+    }
+
+    /* Add reference to prevent deletion, and to cancel idle timer if
+     * it's running.
      */
-    pj_assert (PJSIP_SYN_ERR_EXCEPTION == -1);
-    status = pj_exception_id_alloc("PJSIP syntax error", 
-				   &PJSIP_SYN_ERR_EXCEPTION);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
+    pjsip_transport_add_ref(tr);
 
-    /*
-     * Invalid value exception.
+    /* Fill in tp_info. */
+    tdata->tp_info.transport = tr;
+    pj_memcpy(&tdata->tp_info.dst_addr, addr, addr_len);
+    tdata->tp_info.dst_addr_len = addr_len;
+
+    pj_inet_ntop(((pj_sockaddr*)addr)->addr.sa_family,
+		 pj_sockaddr_get_addr(addr),
+		 tdata->tp_info.dst_name,
+		 sizeof(tdata->tp_info.dst_name));
+    tdata->tp_info.dst_port = pj_sockaddr_get_port(addr);
+
+    /* Distribute to modules. 
+     * When the message reach mod_msg_print, the contents of the message will
+     * be "printed" to contiguous buffer.
      */
-    pj_assert (PJSIP_EINVAL_ERR_EXCEPTION == -2);
-    status = pj_exception_id_alloc("PJSIP invalid value error", 
-				   &PJSIP_EINVAL_ERR_EXCEPTION);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
+    if (tr->tpmgr->on_tx_msg) {
+	status = (*tr->tpmgr->on_tx_msg)(tr->endpt, tdata);
+	if (status != PJ_SUCCESS) {
+	    pjsip_transport_dec_ref(tr);
+	    return status;
+	}
+    }
 
-    /*
-     * Init character input spec (cis)
+    /* Save callback data. */
+    tdata->token = token;
+    tdata->cb = cb;
+
+    /* Add reference counter. */
+    pjsip_tx_data_add_ref(tdata);
+
+    /* Mark as pending. */
+    tdata->is_pending = 1;
+
+    /* Send to transport. */
+    status = (*tr->send_msg)(tr, tdata,  addr, addr_len, (void*)tdata, 
+			     &transport_send_callback);
+
+    if (status != PJ_EPENDING) {
+	tdata->is_pending = 0;
+	pjsip_tx_data_dec_ref(tdata);
+    }
+
+    pjsip_transport_dec_ref(tr);
+    return status;
+}
+
+
+/* send_raw() callback */
+static void send_raw_callback(pjsip_transport *transport,
+			      void *token,
+			      pj_ssize_t size)
+{
+    pjsip_tx_data *tdata = (pjsip_tx_data*) token;
+
+    /* Mark pending off so that app can resend/reuse txdata from inside
+     * the callback.
      */
+    tdata->is_pending = 0;
 
-    pj_cis_buf_init(&cis_buf);
+    /* Call callback, if any. */
+    if (tdata->cb) {
+	(*tdata->cb)(tdata->token, tdata, size);
+    }
 
-    status = pj_cis_init(&cis_buf, &pconst.pjsip_DIGIT_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_num(&pconst.pjsip_DIGIT_SPEC);
-    
-    status = pj_cis_init(&cis_buf, &pconst.pjsip_ALPHA_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_alpha( &pconst.pjsip_ALPHA_SPEC );
-    
-    status = pj_cis_init(&cis_buf, &pconst.pjsip_ALNUM_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_alpha( &pconst.pjsip_ALNUM_SPEC );
-    pj_cis_add_num( &pconst.pjsip_ALNUM_SPEC );
+    /* Decrement tdata reference count. */
+    pjsip_tx_data_dec_ref(tdata);
 
-    status = pj_cis_init(&cis_buf, &pconst.pjsip_NOT_NEWLINE);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str(&pconst.pjsip_NOT_NEWLINE, "\r\n");
-    pj_cis_invert(&pconst.pjsip_NOT_NEWLINE);
+    /* Decrement transport reference count */
+    pjsip_transport_dec_ref(transport);
+}
 
-    status = pj_cis_init(&cis_buf, &pconst.pjsip_NOT_COMMA_OR_NEWLINE);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str( &pconst.pjsip_NOT_COMMA_OR_NEWLINE, ",\r\n");
-    pj_cis_invert(&pconst.pjsip_NOT_COMMA_OR_NEWLINE);
 
-    status = pj_cis_dup(&pconst.pjsip_TOKEN_SPEC, &pconst.pjsip_ALNUM_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str( &pconst.pjsip_TOKEN_SPEC, TOKEN);
+/* Send raw data */
+PJ_DEF(pj_status_t) pjsip_tpmgr_send_raw(pjsip_tpmgr *mgr,
+					 pjsip_transport_type_e tp_type,
+					 const pjsip_tpselector *sel,
+					 pjsip_tx_data *tdata,
+					 const void *raw_data,
+					 pj_size_t data_len,
+					 const pj_sockaddr_t *addr,
+					 int addr_len,
+					 void *token,
+					 pjsip_tp_send_callback cb)
+{
+    pjsip_transport *tr;
+    pj_status_t status;
+ 
+    /* Acquire the transport */
+    status = pjsip_tpmgr_acquire_transport(mgr, tp_type, addr, addr_len,
+					   sel, &tr);
+    if (status != PJ_SUCCESS)
+	return status;
 
-    status = pj_cis_dup(&pconst.pjsip_TOKEN_SPEC_ESC, &pconst.pjsip_TOKEN_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_del_str(&pconst.pjsip_TOKEN_SPEC_ESC, "%");
+    /* Create transmit data buffer if one is not specified */
+    if (tdata == NULL) {
+	status = pjsip_endpt_create_tdata(tr->endpt, &tdata);
+	if (status != PJ_SUCCESS) {
+	    pjsip_transport_dec_ref(tr);
+	    return status;
+	}
 
-    status = pj_cis_dup(&pconst.pjsip_VIA_PARAM_SPEC, &pconst.pjsip_TOKEN_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str(&pconst.pjsip_VIA_PARAM_SPEC, "[:]");
+	tdata->info = "raw";
 
-    status = pj_cis_dup(&pconst.pjsip_VIA_PARAM_SPEC_ESC, &pconst.pjsip_TOKEN_SPEC_ESC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str(&pconst.pjsip_VIA_PARAM_SPEC_ESC, "[:]");
+	/* Add reference counter. */
+	pjsip_tx_data_add_ref(tdata);
+    }
 
-    status = pj_cis_dup(&pconst.pjsip_HOST_SPEC, &pconst.pjsip_ALNUM_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str( &pconst.pjsip_HOST_SPEC, HOST);
+    /* Allocate buffer */
+    if (tdata->buf.start == NULL ||
+	(tdata->buf.end - tdata->buf.start) < (int)data_len)
+    {
+	/* Note: data_len may be zero, so allocate +1 */
+	tdata->buf.start = (char*) pj_pool_alloc(tdata->pool, data_len+1);
+	tdata->buf.end = tdata->buf.start + data_len + 1;
+    }
+ 
+    /* Copy data, if any! (application may send zero len packet) */
+    if (data_len) {
+	pj_memcpy(tdata->buf.start, raw_data, data_len);
+    }
+    tdata->buf.cur = tdata->buf.start + data_len;
+ 
+    /* Save callback data. */
+    tdata->token = token;
+    tdata->cb = cb;
 
-    status = pj_cis_dup(&pconst.pjsip_HEX_SPEC, &pconst.pjsip_DIGIT_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str( &pconst.pjsip_HEX_SPEC, HEX_DIGIT);
+    /* Mark as pending. */
+    tdata->is_pending = 1;
 
-    status = pj_cis_dup(&pconst.pjsip_PARAM_CHAR_SPEC, &pconst.pjsip_ALNUM_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str(&pconst.pjsip_PARAM_CHAR_SPEC, PARAM_CHAR);
-
-    status = pj_cis_dup(&pconst.pjsip_PARAM_CHAR_SPEC_ESC, &pconst.pjsip_PARAM_CHAR_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_del_str(&pconst.pjsip_PARAM_CHAR_SPEC_ESC, ESCAPED);
-
-    status = pj_cis_dup(&pconst.pjsip_HDR_CHAR_SPEC, &pconst.pjsip_ALNUM_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str(&pconst.pjsip_HDR_CHAR_SPEC, HDR_CHAR);
-
-    status = pj_cis_dup(&pconst.pjsip_HDR_CHAR_SPEC_ESC, &pconst.pjsip_HDR_CHAR_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_del_str(&pconst.pjsip_HDR_CHAR_SPEC_ESC, ESCAPED);
-
-    status = pj_cis_dup(&pconst.pjsip_USER_SPEC, &pconst.pjsip_ALNUM_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str( &pconst.pjsip_USER_SPEC, UNRESERVED ESCAPED USER_UNRESERVED );
-
-    status = pj_cis_dup(&pconst.pjsip_USER_SPEC_ESC, &pconst.pjsip_USER_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_del_str( &pconst.pjsip_USER_SPEC_ESC, ESCAPED);
-
-    status = pj_cis_dup(&pconst.pjsip_USER_SPEC_LENIENT, &pconst.pjsip_USER_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str(&pconst.pjsip_USER_SPEC_LENIENT, "#");
-
-    status = pj_cis_dup(&pconst.pjsip_USER_SPEC_LENIENT_ESC, &pconst.pjsip_USER_SPEC_ESC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str(&pconst.pjsip_USER_SPEC_LENIENT_ESC, "#");
-
-    status = pj_cis_dup(&pconst.pjsip_PASSWD_SPEC, &pconst.pjsip_ALNUM_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str( &pconst.pjsip_PASSWD_SPEC, UNRESERVED ESCAPED PASS);
-
-    status = pj_cis_dup(&pconst.pjsip_PASSWD_SPEC_ESC, &pconst.pjsip_PASSWD_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_del_str( &pconst.pjsip_PASSWD_SPEC_ESC, ESCAPED);
-
-    status = pj_cis_init(&cis_buf, &pconst.pjsip_PROBE_USER_HOST_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str( &pconst.pjsip_PROBE_USER_HOST_SPEC, "@ \n>");
-    pj_cis_invert( &pconst.pjsip_PROBE_USER_HOST_SPEC );
-
-    status = pj_cis_init(&cis_buf, &pconst.pjsip_DISPLAY_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str( &pconst.pjsip_DISPLAY_SPEC, ":\r\n<");
-    pj_cis_invert(&pconst.pjsip_DISPLAY_SPEC);
-
-    status = pj_cis_dup(&pconst.pjsip_OTHER_URI_CONTENT, &pconst.pjsip_ALNUM_SPEC);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-    pj_cis_add_str( &pconst.pjsip_OTHER_URI_CONTENT, GENERIC_URI_CHARS);
-
-    /*
-     * Register URI parsers.
-     */
-
-    status = pjsip_register_uri_parser("sip", &int_parse_sip_url);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_uri_parser("sips", &int_parse_sip_url);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    /*
-     * Register header parsers.
-     */
-
-    status = pjsip_register_hdr_parser( "Accept", NULL, &parse_hdr_accept);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Allow", NULL, &parse_hdr_allow);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Call-ID", "i", &parse_hdr_call_id);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Contact", "m", &parse_hdr_contact);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Content-Length", "l", 
-                                        &parse_hdr_content_len);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Content-Type", "c", 
-                                        &parse_hdr_content_type);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "CSeq", NULL, &parse_hdr_cseq);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Expires", NULL, &parse_hdr_expires);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "From", "f", &parse_hdr_from);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Max-Forwards", NULL, 
-                                        &parse_hdr_max_forwards);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Min-Expires", NULL, 
-                                        &parse_hdr_min_expires);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Record-Route", NULL, &parse_hdr_rr);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Route", NULL, &parse_hdr_route);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Require", NULL, &parse_hdr_require);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Retry-After", NULL, 
-                                        &parse_hdr_retry_after);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Supported", "k", 
-                                        &parse_hdr_supported);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "To", "t", &parse_hdr_to);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Unsupported", NULL, 
-                                        &parse_hdr_unsupported);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    status = pjsip_register_hdr_parser( "Via", "v", &parse_hdr_via);
-    PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
-
-    /* 
-     * Register auth parser. 
-     */
-
-    status = pjsip_auth_init_parser();
+    /* Send to transport */
+    status = tr->send_msg(tr, tdata, addr, addr_len,
+			  tdata, &send_raw_callback);
+ 
+    if (status != PJ_EPENDING) {
+	/* callback will not be called, so destroy tdata now. */
+	pjsip_tx_data_dec_ref(tdata);
+	pjsip_transport_dec_ref(tr);
+    }
 
     return status;
 }
 
-void init_sip_parser(void)
+
+static void transport_idle_callback(pj_timer_heap_t *timer_heap,
+				    struct pj_timer_entry *entry)
 {
-    pj_enter_critical_section();
-    if (++parser_is_initialized == 1) {
-	init_parser();
-    }
-    pj_leave_critical_section();
-}
+    pjsip_transport *tp = (pjsip_transport*) entry->user_data;
+    pj_assert(tp != NULL);
 
-void deinit_sip_parser(void)
-{
-    pj_enter_critical_section();
-    if (--parser_is_initialized == 0) {
-	/* Clear header handlers */
-	pj_bzero(handler, sizeof(handler));
-	handler_count = 0;
+    PJ_UNUSED_ARG(timer_heap);
 
-	/* Clear URI handlers */
-	pj_bzero(uri_handler, sizeof(uri_handler));
-	uri_handler_count = 0;
+    if (entry->id == PJ_FALSE)
+	return;
 
-	/* Deregister exception ID */
-	pj_exception_id_free(PJSIP_SYN_ERR_EXCEPTION);
-	PJSIP_SYN_ERR_EXCEPTION = -1;
-
-	pj_exception_id_free(PJSIP_EINVAL_ERR_EXCEPTION);
-	PJSIP_EINVAL_ERR_EXCEPTION = -2;
-    }
-    pj_leave_critical_section();
-}
-
-/* Compare the handler record with header name, and return:
- * - 0  if handler match.
- * - <0 if handler is 'less' than the header name.
- * - >0 if handler is 'greater' than header name.
- */
-PJ_INLINE(int) compare_handler( const handler_rec *r1, 
-				const char *name, 
-				pj_size_t name_len,
-				pj_uint32_t hash )
-{
-    PJ_UNUSED_ARG(name_len);
-
-    /* Compare hashed value. */
-    if (r1->hname_hash < hash)
-	return -1;
-    if (r1->hname_hash > hash)
-	return 1;
-
-    /* Compare length. */
-    /*
-    if (r1->hname_len < name_len)
-	return -1;
-    if (r1->hname_len > name_len)
-	return 1;
-     */
-
-    /* Equal length and equal hash. compare the strings. */
-    return pj_memcmp(r1->hname, name, name_len);
-}
-
-/* Register one handler for one header name. */
-static pj_status_t int_register_parser( const char *name, 
-                                        pjsip_parse_hdr_func *fptr )
-{
-    unsigned	pos;
-    handler_rec rec;
-
-    if (handler_count >= PJ_ARRAY_SIZE(handler)) {
-	pj_assert(!"Too many handlers!");
-	return PJ_ETOOMANY;
-    }
-
-    /* Initialize temporary handler. */
-    rec.handler = fptr;
-    rec.hname_len = strlen(name);
-    if (rec.hname_len >= sizeof(rec.hname)) {
-	pj_assert(!"Header name is too long!");
-	return PJ_ENAMETOOLONG;
-    }
-    /* Copy name. */
-    pj_memcpy(rec.hname, name, rec.hname_len);
-    rec.hname[rec.hname_len] = '\0';
-
-    /* Calculate hash value. */
-    rec.hname_hash = pj_hash_calc(0, rec.hname, (unsigned)rec.hname_len);
-
-    /* Get the pos to insert the new handler. */
-    for (pos=0; pos < handler_count; ++pos) {
-	int d;
-	d = compare_handler(&handler[pos], rec.hname, rec.hname_len, 
-                            rec.hname_hash);
-	if (d == 0) {
-	    pj_assert(0);
-	    return PJ_EEXISTS;
-	}
-	if (d > 0) {
-	    break;
-	}
-    }
-
-    /* Shift handlers. */
-    if (pos != handler_count) {
-	pj_memmove( &handler[pos+1], &handler[pos], 
-                    (handler_count-pos)*sizeof(handler_rec));
-    }
-    /* Add new handler. */
-    pj_memcpy( &handler[pos], &rec, sizeof(handler_rec));
-    ++handler_count;
-
-    return PJ_SUCCESS;
-}
-
-/* Register parser handler. If both header name and short name are valid,
- * then two instances of handler will be registered.
- */
-PJ_DEF(pj_status_t) pjsip_register_hdr_parser( const char *hname,
-					       const char *hshortname,
-					       pjsip_parse_hdr_func *fptr)
-{
-    unsigned i;
-    pj_size_t len;
-    char hname_lcase[PJSIP_MAX_HNAME_LEN+1];
-    pj_status_t status;
-
-    /* Check that name is not too long */
-    len = pj_ansi_strlen(hname);
-    if (len > PJSIP_MAX_HNAME_LEN) {
-	pj_assert(!"Header name is too long!");
-	return PJ_ENAMETOOLONG;
-    }
-
-    /* Register the normal Mixed-Case name */
-    status = int_register_parser(hname, fptr);
-    if (status != PJ_SUCCESS) {
-	return status;
-    }
-
-    /* Get the lower-case name */
-    for (i=0; i<len; ++i) {
-	hname_lcase[i] = (char)pj_tolower(hname[i]);
-    }
-    hname_lcase[len] = '\0';
-
-    /* Register the lower-case version of the name */
-    status = int_register_parser(hname_lcase, fptr);
-    if (status != PJ_SUCCESS) {
-	return status;
-    }
-    
-
-    /* Register the shortname version of the name */
-    if (hshortname) {
-        status = int_register_parser(hshortname, fptr);
-        if (status != PJ_SUCCESS) 
-	    return status;
-    }
-    return PJ_SUCCESS;
+    entry->id = PJ_FALSE;
+    pjsip_transport_destroy(tp);
 }
 
 
-/* Find handler to parse the header name. */
-static pjsip_parse_hdr_func * find_handler_imp(pj_uint32_t  hash, 
-					       const pj_str_t *hname)
+static pj_bool_t is_transport_valid(pjsip_transport *tp, pjsip_tpmgr *tpmgr,
+				    const pjsip_transport_key *key,
+				    int key_len)
 {
-    handler_rec *first;
-    int		 comp;
-    unsigned	 n;
+    transport *tp_entry;
 
-    /* Binary search for the handler. */
-    comp = -1;
-    first = &handler[0];
-    n = handler_count;
-    for (; n > 0; ) {
-	unsigned half = n / 2;
-	handler_rec *mid = first + half;
+    tp_entry = (transport *)pj_hash_get(tpmgr->table, key, key_len, NULL);
+    if (tp_entry != NULL) {
 
-	comp = compare_handler(mid, hname->ptr, hname->slen, hash);
-	if (comp < 0) {
-	    first = ++mid;
-	    n -= half + 1;
-	} else if (comp==0) {
-	    first = mid;
-	    break;
-	} else {
-	    n = half;
-	}
-    }
-
-    return comp==0 ? first->handler : NULL;
-}
-
-
-/* Find handler to parse the header name. */
-static pjsip_parse_hdr_func* find_handler(const pj_str_t *hname)
-{
-    pj_uint32_t hash;
-    char hname_copy[PJSIP_MAX_HNAME_LEN];
-    pj_str_t tmp;
-    pjsip_parse_hdr_func *func;
-
-    if (hname->slen >= PJSIP_MAX_HNAME_LEN) {
-	/* Guaranteed not to be able to find handler. */
-        return NULL;
-    }
-
-    /* First, common case, try to find handler with exact name */
-    hash = pj_hash_calc(0, hname->ptr, (unsigned)hname->slen);
-    func = find_handler_imp(hash, hname);
-    if (func)
-	return func;
-
-
-    /* If not found, try converting the header name to lowercase and
-     * search again.
-     */
-    hash = pj_hash_calc_tolower(0, hname_copy, hname);
-    tmp.ptr = hname_copy;
-    tmp.slen = hname->slen;
-    return find_handler_imp(hash, &tmp);
-}
-
-
-/* Find URI handler. */
-static pjsip_parse_uri_func* find_uri_handler(const pj_str_t *scheme)
-{
-    unsigned i;
-    for (i=0; i<uri_handler_count; ++i) {
-	if (parser_stricmp(uri_handler[i].scheme, (*scheme))==0)
-	    return uri_handler[i].parse;
-    }
-    return &int_parse_other_uri;
-}
-
-/* Register URI parser. */
-PJ_DEF(pj_status_t) pjsip_register_uri_parser( char *scheme,
-					       pjsip_parse_uri_func *func)
-{
-    if (uri_handler_count >= PJ_ARRAY_SIZE(uri_handler))
-	return PJ_ETOOMANY;
-
-    uri_handler[uri_handler_count].scheme = pj_str((char*)scheme);
-    uri_handler[uri_handler_count].parse = func;
-    ++uri_handler_count;
-
-    return PJ_SUCCESS;
-}
-
-/* Public function to parse SIP message. */
-PJ_DEF(pjsip_msg*) pjsip_parse_msg( pj_pool_t *pool, 
-                                    char *buf, pj_size_t size,
-				    pjsip_parser_err_report *err_list)
-{
-    pjsip_msg *msg = NULL;
-    pj_scanner scanner;
-    pjsip_parse_ctx context;
-
-    pj_scan_init(&scanner, buf, size, PJ_SCAN_AUTOSKIP_WS_HEADER, 
-                 &on_syntax_error);
-
-    context.scanner = &scanner;
-    context.pool = pool;
-    context.rdata = NULL;
-
-    msg = int_parse_msg(&context, err_list);
-
-    pj_scan_fini(&scanner);
-    return msg;
-}
-
-
-/*处理sip message的语法错误，返回一个sip message*/
-/* Public function to parse as rdata.*/
-PJ_DEF(pjsip_msg *) pjsip_parse_rdata( char *buf, pj_size_t size,
-                                       pjsip_rx_data *rdata )
-{
-    PJ_LOG(1, ("Martin:", "Start check syntax problem of the sip message!...from:sip_parser.c:pjsip_parse_rdata()"));
-    pj_scanner scanner;
-    pjsip_parse_ctx context;
-
-    pj_scan_init(&scanner, buf, size, PJ_SCAN_AUTOSKIP_WS_HEADER, 
-                 &on_syntax_error);
-
-    context.scanner = &scanner;
-    context.pool = rdata->tp_info.pool;
-    context.rdata = rdata;
-
-    /*调用int_parse_msg()函数进行sip message的语法检查*/
-    rdata->msg_info.msg = int_parse_msg(&context, &rdata->msg_info.parse_err);
-
-    pj_scan_fini(&scanner);
-    return rdata->msg_info.msg;
-}
-
-/* Determine if a message has been received. */
-PJ_DEF(pj_status_t) pjsip_find_msg( const char *buf, pj_size_t size, 
-				  pj_bool_t is_datagram, pj_size_t *msg_size)
-{
-#if PJ_HAS_TCP
-    const char *volatile hdr_end;
-    const char *volatile body_start;
-    const char *pos;
-    const char *volatile line;
-    int content_length = -1;
-    pj_str_t cur_msg;
-    pj_status_t status = PJSIP_EMISSINGHDR;
-    const pj_str_t end_hdr = { "\n\r\n", 3};
-
-    *msg_size = size;
-
-    /* For datagram, the whole datagram IS the message. */
-    if (is_datagram) {
-	return PJ_SUCCESS;
-    }
-
-
-    /* Find the end of header area by finding an empty line. 
-     * Don't use plain strstr() since we want to be able to handle
-     * NULL character in the message
-     */
-    cur_msg.ptr = (char*)buf; cur_msg.slen = size;
-    pos = pj_strstr(&cur_msg, &end_hdr);
-    if (pos == NULL) {
-	return PJSIP_EPARTIALMSG;
-    }
- 
-    hdr_end = pos+1;
-    body_start = pos+3;
-
-    /* Find "Content-Length" header the hard way. */
-    line = pj_strchr(&cur_msg, '\n');
-    while (line && line < hdr_end) {
-	++line;
-	if ( ((*line=='C' || *line=='c') && 
-              strnicmp_alnum(line, "Content-Length", 14) == 0) ||
-	     ((*line=='l' || *line=='L') && 
-              (*(line+1)==' ' || *(line+1)=='\t' || *(line+1)==':')))
-	{
-	    /* Try to parse the header. */
-	    pj_scanner scanner;
-	    PJ_USE_EXCEPTION;
-
-	    /* The buffer passed to the scanner is not NULL terminated,
-             * but should be safe. See ticket #2063.
-	     */ 
-	    pj_scan_init(&scanner, (char*)line, hdr_end-line, 
-			 PJ_SCAN_AUTOSKIP_WS_HEADER, &on_syntax_error);
-
-	    PJ_TRY {
-		pj_str_t str_clen;
-
-		/* Get "Content-Length" or "L" name */
-		if (*line=='C' || *line=='c')
-		    pj_scan_advance_n(&scanner, 14, PJ_TRUE);
-		else if (*line=='l' || *line=='L')
-		    pj_scan_advance_n(&scanner, 1, PJ_TRUE);
-
-		/* Get colon */
-		if (pj_scan_get_char(&scanner) != ':') {
-		    PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
-		}
-
-		/* Get number */
-		pj_scan_get(&scanner, &pconst.pjsip_DIGIT_SPEC, &str_clen);
-
-		/* Get newline. */
-		pj_scan_get_newline(&scanner);
-
-		/* Found a valid Content-Length header. */
-		strtoi_validate(&str_clen, PJSIP_MIN_CONTENT_LENGTH,
-				PJSIP_MAX_CONTENT_LENGTH, &content_length);
-	    }
-	    PJ_CATCH_ANY {
-		int eid = PJ_GET_EXCEPTION();
-		if (eid == PJSIP_SYN_ERR_EXCEPTION) {
-		    status = PJSIP_EMISSINGHDR;
-		} else if (eid == PJSIP_EINVAL_ERR_EXCEPTION) {
-		    status = PJSIP_EINVALIDHDR;
-		}
-		content_length = -1;
-	    }
-	    PJ_END
-
-	    pj_scan_fini(&scanner);
-	}
-
-	/* Found valid Content-Length? */
-	if (content_length != -1)
-	    break;
-
-	/* Go to next line. */
-	cur_msg.slen -= (line - cur_msg.ptr);
-	cur_msg.ptr = (char*)line;
-	line = pj_strchr(&cur_msg, '\n');
-    }
-
-    /* Found Content-Length? */
-    if (content_length == -1) {
-	return status;
-    }
-
-    /* Enough packet received? */
-    *msg_size = (body_start - buf) + content_length;
-    return (*msg_size) <= size ? PJ_SUCCESS : PJSIP_EPARTIALMSG;
-#else
-    PJ_UNUSED_ARG(buf);
-    PJ_UNUSED_ARG(is_datagram);
-    *msg_size = size;
-    return PJ_SUCCESS;
-#endif
-}
-
-/* Public function to parse URI */
-PJ_DEF(pjsip_uri*) pjsip_parse_uri( pj_pool_t *pool, 
-					 char *buf, pj_size_t size,
-					 unsigned option)
-{
-    pj_scanner scanner;
-    pjsip_uri *uri = NULL;
-    PJ_USE_EXCEPTION;
-
-    pj_scan_init(&scanner, buf, size, 0, &on_syntax_error);
-
-    
-    PJ_TRY {
-	uri = int_parse_uri_or_name_addr(&scanner, pool, option);
-    }
-    PJ_CATCH_ANY {
-	uri = NULL;
-    }
-    PJ_END;
-
-    /* Must have exhausted all inputs. */
-    if (pj_scan_is_eof(&scanner) || IS_NEWLINE(*scanner.curptr)) {
-	/* Success. */
-	pj_scan_fini(&scanner);
-	return uri;
-    }
-
-    /* Still have some characters unparsed. */
-    pj_scan_fini(&scanner);
-    return NULL;
-}
-
-/* SIP version */
-static void parse_sip_version(pj_scanner *scanner)
-{
-    pj_str_t SIP = { "SIP", 3 };
-    pj_str_t V2 = { "2.0", 3 };
-    pj_str_t sip, version;
-
-    pj_scan_get( scanner, &pconst.pjsip_ALPHA_SPEC, &sip);
-    if (pj_scan_get_char(scanner) != '/')
-	on_syntax_error(scanner);
-    pj_scan_get_n( scanner, 3, &version);
-    if (pj_stricmp(&sip, &SIP) || pj_stricmp(&version, &V2))
-	on_syntax_error(scanner);
-}
-
-static pj_bool_t is_next_sip_version(pj_scanner *scanner)
-{
-    pj_str_t SIP = { "SIP", 3 };
-    pj_str_t sip;
-    int c;
-
-    c = pj_scan_peek(scanner, &pconst.pjsip_ALPHA_SPEC, &sip);
-    /* return TRUE if it is "SIP" followed by "/" or space.
-     * we include space since the "/" may be separated by space,
-     * although this would mean it would return TRUE if it is a
-     * request and the method is "SIP"!
-     */
-    return c && (c=='/' || c==' ' || c=='\t') && pj_stricmp(&sip, &SIP)==0;
-}
-
-/*Martin 2021-03-11*/
-/*检查sip message语法是否正确的函数*/
-/* Internal function to parse SIP message */
-static pjsip_msg *int_parse_msg( pjsip_parse_ctx *ctx,
-				 pjsip_parser_err_report *err_list)
-{
-     PJ_LOG(1, ("Martin:", "Call function:int_parse_msg()to check the syntax!...from:sip_parser.c:int_parse_msg()"));
-    /* These variables require "volatile" so their values get
-     * preserved when re-entering the PJ_TRY block after an error.
-     */
-    volatile pj_bool_t parsing_headers;
-    pjsip_msg *volatile msg = NULL;
-    pjsip_ctype_hdr *volatile ctype_hdr = NULL;
-
-    pj_str_t hname;
-    pj_scanner *scanner = ctx->scanner;
-    pj_pool_t *pool = ctx->pool;
-    PJ_USE_EXCEPTION;
-
-    parsing_headers = PJ_FALSE;
-
-retry_parse:
-    PJ_TRY 
-    {
-	if (parsing_headers)
-	    goto parse_headers;
-
-	/* Skip leading newlines. */
-	while (IS_NEWLINE(*scanner->curptr)) {
-	    pj_scan_get_newline(scanner);
-	}
-
-	/* Check if we still have valid packet.
-	 * Sometimes endpoints just send blank (CRLF) packets just to keep
-	 * NAT bindings open.
-	 */
-	if (pj_scan_is_eof(scanner))
-	    return NULL;
-
-	/* Parse request or status line */
-	if (is_next_sip_version(scanner)) {
-	    msg = pjsip_msg_create(pool, PJSIP_RESPONSE_MSG);
-	    int_parse_status_line( scanner, &msg->line.status );
-	} else {
-	    msg = pjsip_msg_create(pool, PJSIP_REQUEST_MSG);
-	    int_parse_req_line(scanner, pool, &msg->line.req );
-	}
-
-	parsing_headers = PJ_TRUE;
-
-parse_headers:
-	/* Parse headers. */
+	transport *tp_iter = tp_entry;
 	do {
-	    pjsip_parse_hdr_func * func;
-	    pjsip_hdr *hdr = NULL;
-
-	    /* Init hname just in case parsing fails.
-	     * Ref: PROTOS #2412
-	     */
-	    hname.slen = 0;
-	    
-	    /* Get hname. */
-	    pj_scan_get( scanner, &pconst.pjsip_TOKEN_SPEC, &hname);
-	    if (pj_scan_get_char( scanner ) != ':') {
-		PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
+	    if (tp_iter->tp == tp) {
+		return PJ_TRUE;
 	    }
-	    
-	    /* Find handler. */
-	    func = find_handler(&hname);
-	    
-	    /* Call the handler if found.
-	     * If no handler is found, then treat the header as generic
-	     * hname/hvalue pair.
-	     */
-	    if (func) {
-		hdr = (*func)(ctx);
-
-		/* Note:
-		 *  hdr MAY BE NULL, if parsing does not yield a new header
-		 *  instance, e.g. the values have been added to existing
-		 *  header. See http://trac.pjsip.org/repos/ticket/940
-		 */
-
-		/* Check if we've just parsed a Content-Type header. 
-		 * We will check for a message body if we've got Content-Type 
-		 * header.
-		 */
-		if (hdr && hdr->type == PJSIP_H_CONTENT_TYPE) {
-		    ctype_hdr = (pjsip_ctype_hdr*)hdr;
-		}
-
-	    } else {
-		hdr = parse_hdr_generic_string(ctx);
-		hdr->name = hdr->sname = hname;
-	    }
-	    
-	    /* Single parse of header line can produce multiple headers.
-	     * For example, if one Contact: header contains Contact list
-	     * separated by comma, then these Contacts will be split into
-	     * different Contact headers.
-	     * So here we must insert list instead of just insert one header.
-	     */
-	    if (hdr)
-		pj_list_insert_nodes_before(&msg->hdr, hdr);
-	    
-	    /* Parse until EOF or an empty line is found. */
-	} while (!pj_scan_is_eof(scanner) && !IS_NEWLINE(*scanner->curptr));
-	
-	parsing_headers = PJ_FALSE;
-
-	/* If empty line is found, eat it. */
-	if (!pj_scan_is_eof(scanner)) {
-	    if (IS_NEWLINE(*scanner->curptr)) {
-		pj_scan_get_newline(scanner);
-	    }
-	}
-
-	/* If we have Content-Type header, treat the rest of the message 
-	 * as body.
-	 */
-	if (ctype_hdr && scanner->curptr!=scanner->end) {
-	    /* New: if Content-Type indicates that this is a multipart
-	     * message body, parse it.
-	     */
-	    const pj_str_t STR_MULTIPART = { "multipart", 9 };
-	    pjsip_msg_body *body;
-
-	    if (pj_stricmp(&ctype_hdr->media.type, &STR_MULTIPART)==0) {
-		body = pjsip_multipart_parse(pool, scanner->curptr,
-					     scanner->end - scanner->curptr,
-					     &ctype_hdr->media, 0);
-	    } else {
-		body = PJ_POOL_ALLOC_T(pool, pjsip_msg_body);
-		pjsip_media_type_cp(pool, &body->content_type,
-		                    &ctype_hdr->media);
-
-		body->data = scanner->curptr;
-		body->len = (unsigned)(scanner->end - scanner->curptr);
-		body->print_body = &pjsip_print_text_body;
-		body->clone_data = &pjsip_clone_text_data;
-	    }
-
-	    msg->body = body;
-	}
+	    tp_iter = tp_iter->next;
+	} while (tp_iter != tp_entry);
     }
-    PJ_CATCH_ANY 
-    {
-	/* Exception was thrown during parsing. 
-	 * Skip until newline, and parse next header. 
-	 */
-	if (err_list) {
-	    pjsip_parser_err_report *err_info;
-	    
-	    err_info = PJ_POOL_ALLOC_T(pool, pjsip_parser_err_report);
-	    err_info->except_code = PJ_GET_EXCEPTION();
-	    err_info->line = scanner->line;
-	    /* Scanner's column is zero based, so add 1 */
-	    err_info->col = pj_scan_get_col(scanner) + 1;
-	    if (parsing_headers)
-		err_info->hname = hname;
-	    else if (msg && msg->type == PJSIP_REQUEST_MSG)
-		err_info->hname = pj_str("Request Line");
-	    else if (msg && msg->type == PJSIP_RESPONSE_MSG)
-		err_info->hname = pj_str("Status Line");
-	    else
-		err_info->hname.slen = 0;
-	    
-	    pj_list_insert_before(err_list, err_info);
-	}
-	
-	if (parsing_headers) {
-	    if (!pj_scan_is_eof(scanner)) {
-		/* Skip until next line.
-		 * Watch for header continuation.
-		 */
-		do {
-		    pj_scan_skip_line(scanner);
-		} while (IS_SPACE(*scanner->curptr));
-	    }
 
-	    /* Restore flag. Flag may be set in int_parse_sip_url() */
-	    scanner->skip_ws = PJ_SCAN_AUTOSKIP_WS_HEADER;
-
-	    /* Continue parse next header, if any. */
-	    if (!pj_scan_is_eof(scanner) && !IS_NEWLINE(*scanner->curptr)) {
-		goto retry_parse;
-	    }
-	}
-
-	msg = NULL;
-    }
-    PJ_END;
-
-    return msg;
+    return PJ_FALSE;
 }
 
-
-/* Parse parameter (pname ["=" pvalue]). */
-static void parse_param_imp( pj_scanner *scanner, pj_pool_t *pool,
-			     pj_str_t *pname, pj_str_t *pvalue,
-			     const pj_cis_t *spec, const pj_cis_t *esc_spec,
-			     unsigned option)
-{
-    /* pname */
-    parser_get_and_unescape(scanner, pool, spec, esc_spec, pname);
-
-    /* init pvalue */
-    pvalue->ptr = NULL;
-    pvalue->slen = 0;
-
-    /* pvalue, if any */
-    if (*scanner->curptr == '=') {
-	pj_scan_get_char(scanner);
-	if (!pj_scan_is_eof(scanner)) {
-	    /* pvalue can be a quoted string. */
-	    if (*scanner->curptr == '"') {
-		pj_scan_get_quote( scanner, '"', '"', pvalue);
-		if (option & PJSIP_PARSE_REMOVE_QUOTE) {
-		    pvalue->ptr++;
-		    pvalue->slen -= 2;
-		}
-	    // } else if (*scanner->curptr == '[') {
-		/* pvalue can be a quoted IPv6; in this case, the
-		 * '[' and ']' quote characters are to be removed
-		 * from the pvalue.
-		 *
-		 * Update: this seems to be unnecessary and may cause
-		 * parsing error for cases such as IPv6 reference with
-		 * port number.
-		 */
-		// pj_scan_get_char(scanner);
-		// pj_scan_get_until_ch(scanner, ']', pvalue);
-		// pj_scan_get_char(scanner);
-	    } else if(pj_cis_match(spec, *scanner->curptr)) {
-		parser_get_and_unescape(scanner, pool, spec, esc_spec, pvalue);
-	    }
-	}
-    }
-}
-
-/* Parse parameter (pname ["=" pvalue]) using token. */
-PJ_DEF(void) pjsip_parse_param_imp(pj_scanner *scanner, pj_pool_t *pool,
-			     	   pj_str_t *pname, pj_str_t *pvalue,
-			     	   unsigned option)
-{
-    parse_param_imp(scanner, pool, pname, pvalue, &pconst.pjsip_TOKEN_SPEC,
-		    &pconst.pjsip_TOKEN_SPEC_ESC, option);
-}
-
-
-/* Parse parameter (pname ["=" pvalue]) using paramchar. */
-PJ_DEF(void) pjsip_parse_uri_param_imp( pj_scanner *scanner, pj_pool_t *pool,
-			       		pj_str_t *pname, pj_str_t *pvalue,
-			       		unsigned option)
-{
-    parse_param_imp(scanner,pool, pname, pvalue, &pconst.pjsip_PARAM_CHAR_SPEC,
-		    &pconst.pjsip_PARAM_CHAR_SPEC_ESC, option);
-}
-
-
-/* Parse parameter (";" pname ["=" pvalue]) in SIP header. */
-static void int_parse_param( pj_scanner *scanner, pj_pool_t *pool,
-			     pj_str_t *pname, pj_str_t *pvalue,
-			     unsigned option)
-{
-    /* Get ';' character */
-    pj_scan_get_char(scanner);
-
-    /* Get pname and optionally pvalue */
-    pjsip_parse_param_imp(scanner, pool, pname, pvalue, option);
-}
-
-/* Parse parameter (";" pname ["=" pvalue]) in URI. */
-static void int_parse_uri_param( pj_scanner *scanner, pj_pool_t *pool,
-				 pj_str_t *pname, pj_str_t *pvalue,
-				 unsigned option)
-{
-    /* Get ';' character */
-    pj_scan_get_char(scanner);
-
-    /* Get pname and optionally pvalue */
-    pjsip_parse_uri_param_imp(scanner, pool, pname, pvalue, 
-			      option);
-}
-
-
-/* Parse header parameter. */
-static void int_parse_hparam( pj_scanner *scanner, pj_pool_t *pool,
-			      pj_str_t *hname, pj_str_t *hvalue )
-{
-    /* Get '?' or '&' character. */
-    pj_scan_get_char(scanner);
-
-    /* hname */
-    parser_get_and_unescape(scanner, pool, &pconst.pjsip_HDR_CHAR_SPEC, 
-			    &pconst.pjsip_HDR_CHAR_SPEC_ESC, hname);
-
-    /* Init hvalue */
-    hvalue->ptr = NULL;
-    hvalue->slen = 0;
-
-    /* pvalue, if any */
-    if (*scanner->curptr == '=') {
-	pj_scan_get_char(scanner);
-	if (!pj_scan_is_eof(scanner) && 
-	    pj_cis_match(&pconst.pjsip_HDR_CHAR_SPEC, *scanner->curptr))
-	{
-	    parser_get_and_unescape(scanner, pool, &pconst.pjsip_HDR_CHAR_SPEC,
-				    &pconst.pjsip_HDR_CHAR_SPEC_ESC, hvalue);
-	}
-    }
-}
-
-/* Parse host part:
- *   host =  hostname / IPv4address / IPv6reference
+/*
+ * Add ref.
  */
-static void int_parse_host(pj_scanner *scanner, pj_str_t *host)
+PJ_DEF(pj_status_t) pjsip_transport_add_ref( pjsip_transport *tp )
 {
-    PJ_LOG(1, ("Martin:", "check syntax on header field : host !...from:sip_parser.c:int_parse_msg()"));
-    if (*scanner->curptr == '[') {
-	/* Note: the '[' and ']' characters are removed from the host */
-	pj_scan_get_char(scanner);
-	pj_scan_get_until_ch(scanner, ']', host);
-	pj_scan_get_char(scanner);
-    } else {
-	pj_scan_get( scanner, &pconst.pjsip_HOST_SPEC, host);
-    }
-}
+    pjsip_tpmgr *tpmgr;
+    pjsip_transport_key key;
+    int key_len;
 
-/* Parse host:port in URI. */
-static void int_parse_uri_host_port( pj_scanner *scanner, 
-				     pj_str_t *host, int *p_port)
-{
-    int_parse_host(scanner, host);
+    PJ_ASSERT_RETURN(tp != NULL, PJ_EINVAL);
 
-    /* RFC3261 section 19.1.2: host don't need to be unescaped */
-    if (*scanner->curptr == ':') {
-	pj_str_t port;
-	pj_scan_get_char(scanner);
-	pj_scan_get(scanner, &pconst.pjsip_DIGIT_SPEC, &port);
-	strtoi_validate(&port, PJSIP_MIN_PORT, PJSIP_MAX_PORT, p_port);
-    } else {
-	*p_port = 0;
-    }
-}
+    /* Add ref transport group lock, if any */
+    if (tp->grp_lock)
+	pj_grp_lock_add_ref(tp->grp_lock);
 
-/* Determine if the next token in an URI is a user specification. */
-static int int_is_next_user(pj_scanner *scanner)
-{
-    pj_str_t dummy;
-    int is_user;
+    /* Cache some vars for checking transport validity later */
+    tpmgr = tp->tpmgr;
+    key_len = sizeof(tp->key.type) + tp->addr_len;
+    pj_memcpy(&key, &tp->key, key_len);
 
-    /* Find character '@'. If this character exist, then the token
-     * must be a username.
-     */
-    if (pj_scan_peek( scanner, &pconst.pjsip_PROBE_USER_HOST_SPEC, &dummy) == '@')
-	is_user = 1;
-    else
-	is_user = 0;
-
-    return is_user;
-}
-
-/* Parse user:pass tokens in an URI. */
-static void int_parse_user_pass( pj_scanner *scanner, pj_pool_t *pool,
-				 pj_str_t *user, pj_str_t *pass)
-{
-    parser_get_and_unescape(scanner, pool, &pconst.pjsip_USER_SPEC_LENIENT, 
-			    &pconst.pjsip_USER_SPEC_LENIENT_ESC, user);
-
-    if ( *scanner->curptr == ':') {
-	pj_scan_get_char( scanner );
-	parser_get_and_unescape(scanner, pool, &pconst.pjsip_PASSWD_SPEC,
-				&pconst.pjsip_PASSWD_SPEC_ESC, pass);
-    } else {
-	pass->ptr = NULL;
-	pass->slen = 0;
+    if (pj_atomic_inc_and_get(tp->ref_cnt) == 1) {
+	pj_lock_acquire(tpmgr->lock);
+	/* Verify again. But first, make sure transport is still valid
+	 * (see #1883).
+	 */
+	if (is_transport_valid(tp, tpmgr, &key, key_len) &&
+	    pj_atomic_get(tp->ref_cnt) == 1)
+	{
+	    if (tp->idle_timer.id != PJ_FALSE) {
+		tp->idle_timer.id = PJ_FALSE;
+		pjsip_endpt_cancel_timer(tp->tpmgr->endpt, &tp->idle_timer);
+	    }
+	}
+	pj_lock_release(tpmgr->lock);
     }
 
-    /* Get the '@' */
-    pj_scan_get_char( scanner );
+    return PJ_SUCCESS;
 }
 
-/* Parse all types of URI. */
-static pjsip_uri *int_parse_uri_or_name_addr( pj_scanner *scanner, pj_pool_t *pool,
-					      unsigned opt)
+/*
+ * Dec ref.
+ */
+PJ_DEF(pj_status_t) pjsip_transport_dec_ref( pjsip_transport *tp )
 {
-    pjsip_uri *uri;
-    int is_name_addr = 0;
+    pjsip_tpmgr *tpmgr;
+    pjsip_transport_key key;
+    int key_len;
 
-    /* Exhaust any whitespaces. */
-    pj_scan_skip_whitespace(scanner);
+    PJ_ASSERT_RETURN(tp != NULL, PJ_EINVAL);
+    pj_assert(pj_atomic_get(tp->ref_cnt) > 0);
 
-    if (*scanner->curptr=='"' || *scanner->curptr=='<') {
-	uri = (pjsip_uri*)int_parse_name_addr( scanner, pool );
-	is_name_addr = 1;
-    } else {
-	pj_str_t scheme;
-	int next_ch;
+    /* Cache some vars for checking transport validity later */
+    tpmgr = tp->tpmgr;
+    key_len = sizeof(tp->key.type) + tp->addr_len;
+    pj_memcpy(&key, &tp->key, key_len);
 
-	next_ch = pj_scan_peek( scanner, &pconst.pjsip_DISPLAY_SPEC, &scheme);
-
-	if (next_ch==':') {
-	    pjsip_parse_uri_func *func = find_uri_handler(&scheme);
-
-	    if (func == NULL) {
-		/* Unsupported URI scheme */
-		PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
+    if (pj_atomic_dec_and_get(tp->ref_cnt) == 0) {
+	pj_lock_acquire(tpmgr->lock);
+	/* Verify again. Do not register timer if the transport is
+	 * being destroyed. But first, make sure transport is still valid
+	 * (see #1883).
+	 */
+	if (is_transport_valid(tp, tpmgr, &key, key_len) &&
+	    !tp->is_destroying && pj_atomic_get(tp->ref_cnt) == 0)
+	{
+	    pj_time_val delay;
+	    
+	    /* If transport is in graceful shutdown, then this is the
+	     * last user who uses the transport. Schedule to destroy the
+	     * transport immediately. Otherwise schedule idle timer.
+	     */
+	    if (tp->is_shutdown) {
+		delay.sec = delay.msec = 0;
+	    } else {
+		delay.sec = (tp->dir==PJSIP_TP_DIR_OUTGOING) ?
+				PJSIP_TRANSPORT_IDLE_TIME :
+				PJSIP_TRANSPORT_SERVER_IDLE_TIME;
+		delay.msec = 0;
 	    }
 
-	    uri = (pjsip_uri*)
-	    	  (*func)(scanner, pool, 
-			  (opt & PJSIP_PARSE_URI_IN_FROM_TO_HDR)==0);
+	    /* Avoid double timer entry scheduling */
+	    if (pj_timer_entry_running(&tp->idle_timer))
+		pjsip_endpt_cancel_timer(tp->tpmgr->endpt, &tp->idle_timer);
 
-
-	} else {
-	    uri = (pjsip_uri*)int_parse_name_addr( scanner, pool );
-	    is_name_addr = 1;
+	    pjsip_endpt_schedule_timer_w_grp_lock(tp->tpmgr->endpt,
+						  &tp->idle_timer,
+						  &delay,
+						  PJ_TRUE,
+						  tp->grp_lock);
 	}
+	pj_lock_release(tpmgr->lock);
     }
 
-    /* Should we return the URI object as name address? */
-    if (opt & PJSIP_PARSE_URI_AS_NAMEADDR) {
-	if (is_name_addr == 0) {
-	    pjsip_name_addr *name_addr;
-
-	    name_addr = pjsip_name_addr_create(pool);
-	    name_addr->uri = uri;
-
-	    uri = (pjsip_uri*)name_addr;
-	}
+    /* Dec ref transport group lock, if any */
+    if (tp->grp_lock) {
+	pj_grp_lock_dec_ref(tp->grp_lock);
     }
 
-    return uri;
+    return PJ_SUCCESS;
 }
 
-/* Parse URI. */
-static pjsip_uri *int_parse_uri(pj_scanner *scanner, pj_pool_t *pool, 
-				pj_bool_t parse_params)
+
+/**
+ * Register a transport.
+ */
+PJ_DEF(pj_status_t) pjsip_transport_register( pjsip_tpmgr *mgr,
+					      pjsip_transport *tp )
 {
-    /* Bug:
-     * This function should not call back int_parse_name_addr() because
-     * it is called by that function. This would cause stack overflow
-     * with PROTOS test #1223.
-    if (*scanner->curptr=='"' || *scanner->curptr=='<') {
-	return (pjsip_uri*)int_parse_name_addr( scanner, pool );
-    } else {
-    */
-	pj_str_t scheme;
-	int colon;
-	pjsip_parse_uri_func *func;
+    int key_len;
+    pj_uint32_t hval;
+    transport *tp_ref = NULL;
+    transport *tp_add = NULL;
 
-	/* Get scheme. */
-	colon = pj_scan_peek(scanner, &pconst.pjsip_TOKEN_SPEC, &scheme);
-	if (colon != ':') {
-	    PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
-	}
-
-	func = find_uri_handler(&scheme);
-	if (func)  {
-	    return (pjsip_uri*)(*func)(scanner, pool, parse_params);
-
-	} else {
-	    /* Unsupported URI scheme */
-	    PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
-	    UNREACHED({ return NULL; /* Not reached. */ })
-	}
+    /* Init. */
+    tp->tpmgr = mgr;
+    pj_bzero(&tp->idle_timer, sizeof(tp->idle_timer));
+    tp->idle_timer.user_data = tp;
+    tp->idle_timer.cb = &transport_idle_callback;
 
     /*
+     * Register to hash table (see Trac ticket #42).
+     */
+    key_len = sizeof(tp->key.type) + tp->addr_len;
+    pj_lock_acquire(mgr->lock);
+
+    hval = 0;
+    tp_ref = (transport *)pj_hash_get(mgr->table, &tp->key, key_len, &hval);
+
+    /* Get an empty entry from the freelist. */
+    if (pj_list_empty(&mgr->tp_entry_freelist)) {
+	unsigned i = 0;
+
+	TRACE_((THIS_FILE, "Transport list is full, allocate new entry"));
+	/* Allocate new entry for the freelist. */
+	for (; i < PJSIP_TRANSPORT_ENTRY_ALLOC_CNT; ++i) {
+	    tp_add = PJ_POOL_ZALLOC_T(mgr->pool, transport);
+	    if (!tp_add)
+		return PJ_ENOMEM;
+	    pj_list_init(tp_add);
+	    pj_list_push_back(&mgr->tp_entry_freelist, tp_add);
+	}
     }
-    */
-}
+    tp_add = mgr->tp_entry_freelist.next;
+    tp_add->tp = tp;
+    pj_list_erase(tp_add);
 
-/* Parse "sip:" and "sips:" URI. 
- * This actually returns (pjsip_sip_uri*) type,
- */
-static void* int_parse_sip_url( pj_scanner *scanner, 
-				pj_pool_t *pool,
-				pj_bool_t parse_params)
-{
-    pj_str_t scheme;
-    pjsip_sip_uri *url = NULL;
-    int colon;
-    int skip_ws = scanner->skip_ws;
-    scanner->skip_ws = 0;
-
-    pj_scan_get(scanner, &pconst.pjsip_TOKEN_SPEC, &scheme);
-    colon = pj_scan_get_char(scanner);
-    if (colon != ':') {
-	PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
-    }
-
-    if (parser_stricmp(scheme, pconst.pjsip_SIP_STR)==0) {
-	url = pjsip_sip_uri_create(pool, 0);
-
-    } else if (parser_stricmp(scheme, pconst.pjsip_SIPS_STR)==0) {
-	url = pjsip_sip_uri_create(pool, 1);
-
+    if (tp_ref) {
+	/* There'a already a transport list from the hash table. Add the 
+	 * new transport to the list.
+	 */
+	pj_list_push_back(tp_ref, tp_add);
+	TRACE_((THIS_FILE, "Remote address already registered, "
+			   "appended the transport to the list"));
     } else {
-	PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
-	/* should not reach here */
-	UNREACHED({
-	    pj_assert(0);
-	    return 0;
-	})
+	/* Transport list not found, add it to the hash table. */
+	pj_hash_set_np(mgr->table, &tp->key, key_len, hval, tp_add->tp_buf,
+		       tp_add);
+	TRACE_((THIS_FILE, "Remote address not registered, "
+			   "added the transport to the hash"));
     }
 
-    if (int_is_next_user(scanner)) {
-	int_parse_user_pass(scanner, pool, &url->user, &url->passwd);
+    /* Add ref transport group lock, if any */
+    if (tp->grp_lock)
+	pj_grp_lock_add_ref(tp->grp_lock);
+
+    pj_lock_release(mgr->lock);
+
+    TRACE_((THIS_FILE, "Transport %s registered: type=%s, remote=%s:%d",
+	    tp->obj_name,
+	    pjsip_transport_get_type_name(tp->key.type),
+	    pj_sockaddr_has_addr(&tp->key.rem_addr)?
+				addr_string(&tp->key.rem_addr):"",
+	    pj_sockaddr_has_addr(&tp->key.rem_addr)?
+				pj_sockaddr_get_port(&tp->key.rem_addr):0));
+
+    return PJ_SUCCESS;
+}
+
+/* Force destroy transport (e.g. during transport manager shutdown. */
+static pj_status_t destroy_transport( pjsip_tpmgr *mgr,
+				      pjsip_transport *tp )
+{
+    int key_len;
+    pj_uint32_t hval;
+    void *entry;
+
+    tp->is_destroying = PJ_TRUE;
+
+    TRACE_((THIS_FILE, "Transport %s is being destroyed", tp->obj_name));
+
+    pj_lock_acquire(tp->lock);
+    pj_lock_acquire(mgr->lock);
+
+    /*
+     * Unregister timer, if any.
+     */
+    //pj_assert(tp->idle_timer.id == PJ_FALSE);
+    if (tp->idle_timer.id != PJ_FALSE) {
+	tp->idle_timer.id = PJ_FALSE;
+	pjsip_endpt_cancel_timer(mgr->endpt, &tp->idle_timer);
     }
 
-    /* Get host:port */
-    int_parse_uri_host_port(scanner, &url->host, &url->port);
+    /*
+     * Unregister from hash table (see Trac ticket #42).
+     */
+    key_len = sizeof(tp->key.type) + tp->addr_len;
+    hval = 0;
+    entry = pj_hash_get(mgr->table, &tp->key, key_len, &hval);
+    if (entry) {
+	transport *tp_ref = (transport *)entry;
+	transport *tp_iter = tp_ref;
+	/* Search the matching entry from the transport list. */
+	do {
+	    if (tp_iter->tp == tp) {
+		transport *tp_next = tp_iter->next;
 
-    /* Get URL parameters. */
-    if (parse_params) {
-      while (*scanner->curptr == ';' ) {
-	pj_str_t pname, pvalue;
+		/* Update hash table :
+		 * - transport list only contain single element, or
+		 * - the entry is the first element of the transport list.
+		 */
+		if (tp_iter == tp_ref) {
+		    pj_hash_set(NULL, mgr->table, &tp->key, key_len, hval,
+				NULL);
 
-	int_parse_uri_param( scanner, pool, &pname, &pvalue, 0);
+		    if (tp_ref->next != tp_ref) {
+			/* The transport list has multiple entry. */
+			pj_hash_set_np(mgr->table, &tp_next->tp->key, key_len,
+				       hval, tp_next->tp_buf, tp_next);
+			TRACE_((THIS_FILE, "Hash entry updated after "
+					   "transport %d being destroyed",
+					   tp->obj_name));
+		    } else {
+			TRACE_((THIS_FILE, "Hash entry deleted after "
+					   "transport %d being destroyed",
+					   tp->obj_name));
+		    }
+		}
 
-	if (!parser_stricmp(pname, pconst.pjsip_USER_STR) && pvalue.slen) {
-	    url->user_param = pvalue;
+		pj_list_erase(tp_iter);
+		/* Put back to the transport freelist. */
+		pj_list_push_back(&mgr->tp_entry_freelist, tp_iter);
 
-	} else if (!parser_stricmp(pname, pconst.pjsip_METHOD_STR) && pvalue.slen) {
-	    url->method_param = pvalue;
+		break;
+	    }
+	    tp_iter = tp_iter->next;
+	} while (tp_iter != tp_ref);
 
-	} else if (!parser_stricmp(pname, pconst.pjsip_TRANSPORT_STR) && pvalue.slen) {
-	    url->transport_param = pvalue;
-
-	} else if (!parser_stricmp(pname, pconst.pjsip_TTL_STR) && pvalue.slen) {
-	    strtoi_validate(&pvalue, PJSIP_MIN_TTL, PJSIP_MAX_TTL,
-			    &url->ttl_param);
-	} else if (!parser_stricmp(pname, pconst.pjsip_MADDR_STR) && pvalue.slen) {
-	    url->maddr_param = pvalue;
-
-	} else if (!parser_stricmp(pname, pconst.pjsip_LR_STR)) {
-	    url->lr_param = 1;
-
-	} else {
-	    pjsip_param *p = PJ_POOL_ALLOC_T(pool, pjsip_param);
-	    p->name = pname;
-	    p->value = pvalue;
-	    pj_list_insert_before(&url->other_param, p);
+	if (tp_iter->tp != tp) {
+	    PJ_LOG(3, (THIS_FILE, "Warning: transport %s being destroyed is "
+				  "not registered", tp->obj_name));
 	}
-      }
+    } else {
+	PJ_LOG(3, (THIS_FILE, "Warning: transport %s being destroyed is "
+			      "not found in the hash table", tp->obj_name));
     }
 
-    /* Get header params. */
-    if (parse_params && *scanner->curptr == '?') {
-      do {
-	pjsip_param *param;
-	param = PJ_POOL_ALLOC_T(pool, pjsip_param);
-	int_parse_hparam(scanner, pool, &param->name, &param->value);
-	pj_list_insert_before(&url->header_param, param);
-      } while (*scanner->curptr == '&');
+    pj_lock_release(mgr->lock);
+    pj_lock_release(tp->lock);
+
+    /* Dec ref transport group lock, if any */
+    if (tp->grp_lock) {
+	pj_grp_lock_dec_ref(tp->grp_lock);
     }
 
-    scanner->skip_ws = skip_ws;
-    pj_scan_skip_whitespace(scanner);
-    return url;
-}
-
-/* Parse nameaddr. */
-static pjsip_name_addr *int_parse_name_addr( pj_scanner *scanner, 
-					     pj_pool_t *pool )
-{
-    int has_bracket;
-    pjsip_name_addr *name_addr;
-
-    name_addr = pjsip_name_addr_create(pool);
-
-    if (*scanner->curptr == '"') {
-	pj_scan_get_quote( scanner, '"', '"', &name_addr->display);
-	/* Trim the leading and ending quote */
-	name_addr->display.ptr++;
-	name_addr->display.slen -= 2;
-
-    } else if (*scanner->curptr != '<') {
-	int next;
-	pj_str_t dummy;
-
-	/* This can be either the start of display name,
-	 * the start of URL ("sip:", "sips:", "tel:", etc.), or '<' char.
-	 * We're only interested in display name, because SIP URL
-	 * will be parser later.
-	 */
-	next = pj_scan_peek(scanner, &pconst.pjsip_DISPLAY_SPEC, &dummy);
-	if (next == '<') {
-	    /* Ok, this is what we're looking for, a display name. */
-	    pj_scan_get_until_ch( scanner, '<', &name_addr->display);
-	    pj_strtrim(&name_addr->display);
-	}
-    }
-
-    /* Manually skip whitespace. */
-    pj_scan_skip_whitespace(scanner);
-
-    /* Get the SIP-URL */
-    has_bracket = (*scanner->curptr == '<');
-    if (has_bracket) {
-	pj_scan_get_char(scanner);
-    } else if (name_addr->display.slen) {
-	/* Must have bracket now (2012-10-26).
-	 * Allowing (invalid) name-addr to pass URI verification will
-	 * cause us to send invalid URI to the wire.
-	 */
-	PJ_THROW( PJSIP_SYN_ERR_EXCEPTION);
-    }
-    name_addr->uri = int_parse_uri( scanner, pool, PJ_TRUE );
-    if (has_bracket) {
-	if (pj_scan_get_char(scanner) != '>')
-	    PJ_THROW( PJSIP_SYN_ERR_EXCEPTION);
-    }
-
-    return name_addr;
-}
-
-
-/* Parse other URI */
-static void* int_parse_other_uri(pj_scanner *scanner, 
-				 pj_pool_t *pool,
-				 pj_bool_t parse_params)
-{
-    pjsip_other_uri *uri = 0;
-    const pjsip_parser_const_t *pc = pjsip_parser_const();
-    int skip_ws = scanner->skip_ws;
-
-    PJ_UNUSED_ARG(parse_params);
-
-    scanner->skip_ws = 0;
-    
-    uri = pjsip_other_uri_create(pool); 
-    
-    pj_scan_get(scanner, &pc->pjsip_TOKEN_SPEC, &uri->scheme);
-    if (pj_scan_get_char(scanner) != ':') {
-	PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
-    }
-    
-    pj_scan_get(scanner, &pc->pjsip_OTHER_URI_CONTENT, &uri->content);
-    scanner->skip_ws = skip_ws;
-    
-    return uri;
-}
-
-
-/* Parse SIP request line. */
-static void int_parse_req_line( pj_scanner *scanner, pj_pool_t *pool,
-				pjsip_request_line *req_line)
-{
-    PJ_LOG(1, ("Martin:", "check syntax on  request line !...from:sip_parser.c:int_parse_msg()"));
-    pj_str_t token;
-
-    pj_scan_get( scanner, &pconst.pjsip_TOKEN_SPEC, &token);
-    pjsip_method_init_np( &req_line->method, &token);
-
-    req_line->uri = int_parse_uri(scanner, pool, PJ_TRUE);
-    parse_sip_version(scanner);
-    pj_scan_get_newline( scanner );
-}
-
-/* Parse status line. */
-static void int_parse_status_line( pj_scanner *scanner, 
-				   pjsip_status_line *status_line)
-{
-    PJ_LOG(1, ("Martin:", "check syntax on  status line !...from:sip_parser.c:int_parse_msg()"));
-    pj_str_t token;
-
-    parse_sip_version(scanner);
-    pj_scan_get( scanner, &pconst.pjsip_DIGIT_SPEC, &token);
-    strtoi_validate(&token, PJSIP_MIN_STATUS_CODE, PJSIP_MAX_STATUS_CODE,
-                    &status_line->code);
-    if (*scanner->curptr != '\r' && *scanner->curptr != '\n')
-	pj_scan_get( scanner, &pconst.pjsip_NOT_NEWLINE, &status_line->reason);
-    else
-	status_line->reason.slen=0, status_line->reason.ptr=NULL;
-    pj_scan_get_newline( scanner );
+    /* Destroy. */
+    return tp->destroy(tp);
 }
 
 
 /*
- * Public API to parse SIP status line.
+ * Start graceful shutdown procedure for this transport. 
  */
-PJ_DEF(pj_status_t) pjsip_parse_status_line( char *buf, pj_size_t size,
-					     pjsip_status_line *status_line)
+PJ_DEF(pj_status_t) pjsip_transport_shutdown(pjsip_transport *tp)
 {
-    pj_scanner scanner;
-    PJ_USE_EXCEPTION;
+    return pjsip_transport_shutdown2(tp, PJ_FALSE);
+}
 
-    pj_bzero(status_line, sizeof(*status_line));
-    pj_scan_init(&scanner, buf, size, PJ_SCAN_AUTOSKIP_WS_HEADER, 
-		 &on_syntax_error);
 
-    PJ_TRY {
-	int_parse_status_line(&scanner, status_line);
-    } 
-    PJ_CATCH_ANY {
-	/* Tolerate the error if it is caused only by missing newline */
-	if (status_line->code == 0 && status_line->reason.slen == 0) {
-	    pj_scan_fini(&scanner);
-	    return PJSIP_EINVALIDMSG;
+/*
+ * Start shutdown procedure for this transport. 
+ */
+PJ_DEF(pj_status_t) pjsip_transport_shutdown2(pjsip_transport *tp,
+					      pj_bool_t force)
+{
+    pjsip_tpmgr *mgr;
+    pj_status_t status;
+    pjsip_tp_state_callback state_cb;
+
+    PJ_LOG(4, (THIS_FILE, "Transport %s shutting down, force=%d",
+			  tp->obj_name, force));
+
+    pj_lock_acquire(tp->lock);
+
+    mgr = tp->tpmgr;
+    pj_lock_acquire(mgr->lock);
+
+    /* Do nothing if transport is being shutdown already */
+    if (tp->is_shutdown) {
+	pj_lock_release(mgr->lock);
+	pj_lock_release(tp->lock);
+	return PJ_SUCCESS;
+    }
+
+    status = PJ_SUCCESS;
+
+    /* Instruct transport to shutdown itself */
+    if (tp->do_shutdown)
+	status = tp->do_shutdown(tp);
+
+    if (status == PJ_SUCCESS)
+	tp->is_shutdown = PJ_TRUE;
+
+    /* Notify application of transport shutdown */
+    state_cb = pjsip_tpmgr_get_state_cb(tp->tpmgr);
+    if (state_cb) {
+	pjsip_transport_state_info state_info;
+
+	pj_bzero(&state_info, sizeof(state_info));
+	state_info.status = PJ_ECANCELLED;
+	(*state_cb)(tp, (force? PJSIP_TP_STATE_DISCONNECTED:
+		    PJSIP_TP_STATE_SHUTDOWN), &state_info);
+    }
+
+    /* If transport reference count is zero, start timer count-down */
+    if (pj_atomic_get(tp->ref_cnt) == 0) {
+	pjsip_transport_add_ref(tp);
+	pjsip_transport_dec_ref(tp);
+    }
+
+    pj_lock_release(mgr->lock);
+    pj_lock_release(tp->lock);
+
+    return status;
+}
+
+
+/**
+ * Unregister transport.
+ */
+PJ_DEF(pj_status_t) pjsip_transport_destroy( pjsip_transport *tp)
+{
+    pjsip_tp_state_callback state_cb;
+
+    /* Must have no user. */
+    PJ_ASSERT_RETURN(pj_atomic_get(tp->ref_cnt) == 0, PJSIP_EBUSY);
+
+    /* Notify application of transport destroy */
+    state_cb = pjsip_tpmgr_get_state_cb(tp->tpmgr);
+    if (state_cb) {
+	pjsip_transport_state_info state_info;
+
+	pj_bzero(&state_info, sizeof(state_info));
+        (*state_cb)(tp, PJSIP_TP_STATE_DESTROY, &state_info);
+    }
+
+    /* Destroy. */
+    return destroy_transport(tp->tpmgr, tp);
+}
+
+
+
+/*****************************************************************************
+ *
+ * TRANSPORT FACTORY
+ *
+ *****************************************************************************/
+
+
+PJ_DEF(pj_status_t) pjsip_tpmgr_register_tpfactory( pjsip_tpmgr *mgr,
+						    pjsip_tpfactory *tpf)
+{
+    pjsip_tpfactory *p;
+    pj_status_t status;
+
+    pj_lock_acquire(mgr->lock);
+
+    /* Check that no same factory has been registered. */
+    status = PJ_SUCCESS;
+    for (p=mgr->factory_list.next; p!=&mgr->factory_list; p=p->next) {
+	if (p == tpf) {
+	    status = PJ_EEXISTS;
+	    break;
 	}
     }
-    PJ_END;
 
-    pj_scan_fini(&scanner);
+    if (status != PJ_SUCCESS) {
+	pj_lock_release(mgr->lock);
+	return status;
+    }
+
+    pj_list_insert_before(&mgr->factory_list, tpf);
+
+    pj_lock_release(mgr->lock);
+
     return PJ_SUCCESS;
 }
 
 
-/* Parse ending of header. */
-static void parse_hdr_end( pj_scanner *scanner )
+/**
+ * Unregister factory.
+ */
+PJ_DEF(pj_status_t) pjsip_tpmgr_unregister_tpfactory( pjsip_tpmgr *mgr,
+						      pjsip_tpfactory *tpf)
 {
-    if (pj_scan_is_eof(scanner)) {
-	;   /* Do nothing. */
-    } else if (*scanner->curptr == '&') {
-	pj_scan_get_char(scanner);
-    } else {
-	pj_scan_get_newline(scanner);
+    pj_lock_acquire(mgr->lock);
+
+    pj_assert(pj_list_find_node(&mgr->factory_list, tpf) == tpf);
+    pj_list_erase(tpf);
+
+    pj_lock_release(mgr->lock);
+
+    return PJ_SUCCESS;
+}
+
+PJ_DECL(void) pjsip_tpmgr_fla2_param_default(pjsip_tpmgr_fla2_param *prm)
+{
+    pj_bzero(prm, sizeof(*prm));
+}
+
+static pj_bool_t pjsip_tpmgr_is_tpfactory_valid(pjsip_tpmgr *mgr,
+						pjsip_tpfactory *tpf)
+{
+    pjsip_tpfactory *p;
+
+    pj_lock_acquire(mgr->lock);
+    for (p=mgr->factory_list.next; p!=&mgr->factory_list; p=p->next) {
+	if (p == tpf) {
+	    pj_lock_release(mgr->lock);
+	    return PJ_TRUE;
+	}
     }
+    pj_lock_release(mgr->lock);
+
+    return PJ_FALSE;
 }
 
-/* Parse ending of header. */
-PJ_DEF(void) pjsip_parse_end_hdr_imp( pj_scanner *scanner )
+/*****************************************************************************
+ *
+ * TRANSPORT MANAGER
+ *
+ *****************************************************************************/
+
+/*
+ * Create a new transport manager.
+ */
+PJ_DEF(pj_status_t) pjsip_tpmgr_create( pj_pool_t *pool,
+					pjsip_endpoint *endpt,
+					pjsip_rx_callback rx_cb,
+					pjsip_tx_callback tx_cb,
+					pjsip_tpmgr **p_mgr)
 {
-    parse_hdr_end(scanner);
+    pjsip_tpmgr *mgr;
+    pj_status_t status;
+    unsigned i = 0;
+    pj_pool_t *mgr_pool;
+
+    PJ_ASSERT_RETURN(pool && endpt && rx_cb && p_mgr, PJ_EINVAL);
+
+    /* Register mod_msg_print module. */
+    status = pjsip_endpt_register_module(endpt, &mod_msg_print);
+    if (status != PJ_SUCCESS)
+	return status;
+
+    /* Create and initialize transport manager. */
+    mgr_pool = pjsip_endpt_create_pool(endpt, "tpmgr",
+				       TPMGR_POOL_INIT_SIZE,
+				       TPMGR_POOL_INC_SIZE);
+    mgr = PJ_POOL_ZALLOC_T(mgr_pool, pjsip_tpmgr);
+    mgr->endpt = endpt;
+    mgr->on_rx_msg = rx_cb;
+    mgr->on_tx_msg = tx_cb;
+    mgr->pool = mgr_pool;
+
+    if (!mgr->pool)
+	return PJ_ENOMEM;
+
+    pj_list_init(&mgr->factory_list);
+    pj_list_init(&mgr->tdata_list);
+    pj_list_init(&mgr->tp_entry_freelist);
+
+    mgr->table = pj_hash_create(mgr->pool, PJSIP_TPMGR_HTABLE_SIZE);
+    if (!mgr->table)
+	return PJ_ENOMEM;
+
+    status = pj_lock_create_recursive_mutex(mgr->pool, "tmgr%p", &mgr->lock);
+    if (status != PJ_SUCCESS)
+	return status;
+
+    for (; i < PJSIP_TRANSPORT_ENTRY_ALLOC_CNT; ++i) {
+	transport *tp_add = NULL;
+
+	tp_add = PJ_POOL_ZALLOC_T(mgr->pool, transport);
+	if (!tp_add)
+	    return PJ_ENOMEM;
+	pj_list_init(tp_add);
+	pj_list_push_back(&mgr->tp_entry_freelist, tp_add);
+    }
+
+#if defined(PJ_DEBUG) && PJ_DEBUG!=0
+    status = pj_atomic_create(mgr->pool, 0, &mgr->tdata_counter);
+    if (status != PJ_SUCCESS) {
+    	pj_lock_destroy(mgr->lock);
+    	return status;
+    }
+#endif
+
+    /* Set transport state callback */
+    pjsip_tpmgr_set_state_cb(mgr, &tp_state_callback);
+
+    PJ_LOG(5, (THIS_FILE, "Transport manager created."));
+
+    *p_mgr = mgr;
+    return PJ_SUCCESS;
 }
 
-/* Parse generic array header. */
-static void parse_generic_array_hdr( pjsip_generic_array_hdr *hdr,
-				     pj_scanner *scanner)
+/* Get the interface to send packet to the specified address */
+static pj_status_t get_net_interface(pjsip_transport_type_e tp_type,
+				     const pj_str_t *dst,
+                                     pj_str_t *itf_str_addr)
 {
-    /* Some header fields allow empty elements in the value:
-     *   Accept, Allow, Supported
+    int af;
+    pj_sockaddr itf_addr;
+    pj_status_t status = -1;
+
+    af = (tp_type & PJSIP_TRANSPORT_IPV6)? pj_AF_INET6() : pj_AF_INET();
+
+    if (pjsip_cfg()->endpt.resolve_hostname_to_get_interface) {
+	status = pj_getipinterface(af, dst, &itf_addr, PJ_TRUE, NULL);
+    }
+
+    if (status != PJ_SUCCESS) { 
+	status = pj_getipinterface(af, dst, &itf_addr, PJ_FALSE, NULL);
+	if (status != PJ_SUCCESS) {
+	    /* If it fails, e.g: on WM6(http://support.microsoft.com/kb/129065),
+	     * just fallback using pj_gethostip(), see ticket #1660.
+	     */
+	    PJ_PERROR(5,(THIS_FILE, status,
+			 "Warning: unable to determine local interface, "
+			 "fallback to default interface!"));
+	    status = pj_gethostip(af, &itf_addr);
+	    if (status != PJ_SUCCESS)
+		return status;
+	}
+    }
+
+    /* Print address */
+    pj_sockaddr_print(&itf_addr, itf_str_addr->ptr,
+		      PJ_INET6_ADDRSTRLEN, 0);
+    itf_str_addr->slen = pj_ansi_strlen(itf_str_addr->ptr);
+
+    return PJ_SUCCESS;
+}
+
+/*
+ * Find out the appropriate local address info (IP address and port) to
+ * advertise in Contact header based on the remote address to be 
+ * contacted. The local address info would be the address name of the
+ * transport or listener which will be used to send the request.
+ *
+ * In this implementation, it will only select the transport based on
+ * the transport type in the request.
+ */
+PJ_DEF(pj_status_t) pjsip_tpmgr_find_local_addr2(pjsip_tpmgr *tpmgr,
+						 pj_pool_t *pool,
+						 pjsip_tpmgr_fla2_param *prm)
+{
+    char tmp_buf[PJ_INET6_ADDRSTRLEN+10];
+    pj_str_t tmp_str;
+    pj_status_t status = PJSIP_EUNSUPTRANSPORT;
+    unsigned flag;
+
+    /* Sanity checks */
+    PJ_ASSERT_RETURN(tpmgr && pool && prm, PJ_EINVAL);
+
+    pj_strset(&tmp_str, tmp_buf, 0);
+    prm->ret_addr.slen = 0;
+    prm->ret_port = 0;
+    prm->ret_tp = NULL;
+
+    flag = pjsip_transport_get_flag_from_type(prm->tp_type);
+
+    if (prm->tp_sel && prm->tp_sel->type == PJSIP_TPSELECTOR_TRANSPORT &&
+	prm->tp_sel->u.transport)
+    {
+	const pjsip_transport *tp = prm->tp_sel->u.transport;
+	if (prm->local_if) {
+	    status = get_net_interface((pjsip_transport_type_e)tp->key.type,
+				       &prm->dst_host, &tmp_str);
+	    if (status != PJ_SUCCESS)
+		goto on_return;
+	    pj_strdup(pool, &prm->ret_addr, &tmp_str);
+	    prm->ret_port = pj_sockaddr_get_port(&tp->local_addr);
+	    prm->ret_tp = tp;
+	} else {
+	    pj_strdup(pool, &prm->ret_addr, &tp->local_name.host);
+	    prm->ret_port = (pj_uint16_t)tp->local_name.port;
+	}
+	status = PJ_SUCCESS;
+
+    } else if (prm->tp_sel && prm->tp_sel->type == PJSIP_TPSELECTOR_LISTENER &&
+	       prm->tp_sel->u.listener)
+    {
+	if (prm->local_if) {
+	    status = get_net_interface(prm->tp_sel->u.listener->type,
+	                               &prm->dst_host, &tmp_str);
+	    if (status != PJ_SUCCESS)
+		goto on_return;
+	    pj_strdup(pool, &prm->ret_addr, &tmp_str);
+	} else {
+	    pj_strdup(pool, &prm->ret_addr,
+		      &prm->tp_sel->u.listener->addr_name.host);
+	}
+	prm->ret_port = (pj_uint16_t)prm->tp_sel->u.listener->addr_name.port;
+	status = PJ_SUCCESS;
+
+    } else if ((flag & PJSIP_TRANSPORT_DATAGRAM) != 0) {
+	pj_sockaddr remote;
+	int addr_len;
+	pjsip_transport *tp;
+
+	pj_bzero(&remote, sizeof(remote));
+	if (prm->tp_type & PJSIP_TRANSPORT_IPV6) {
+	    addr_len = sizeof(pj_sockaddr_in6);
+	    remote.addr.sa_family = pj_AF_INET6();
+	} else {
+	    addr_len = sizeof(pj_sockaddr_in);
+	    remote.addr.sa_family = pj_AF_INET();
+	}
+
+	status = pjsip_tpmgr_acquire_transport(tpmgr, prm->tp_type, &remote,
+					       addr_len, NULL, &tp);
+
+	if (status == PJ_SUCCESS) {
+	    if (prm->local_if) {
+		status = get_net_interface((pjsip_transport_type_e)
+					   tp->key.type,
+					   &prm->dst_host, &tmp_str);
+		if (status != PJ_SUCCESS)
+		    goto on_return;
+		pj_strdup(pool, &prm->ret_addr, &tmp_str);
+		prm->ret_port = pj_sockaddr_get_port(&tp->local_addr);
+		prm->ret_tp = tp;
+	    } else {
+		pj_strdup(pool, &prm->ret_addr, &tp->local_name.host);
+		prm->ret_port = (pj_uint16_t)tp->local_name.port;
+	    }
+
+	    pjsip_transport_dec_ref(tp);
+	}
+
+    } else {
+	/* For connection oriented transport, enum the factories */
+	pjsip_tpfactory *f;
+
+	pj_lock_acquire(tpmgr->lock);
+
+	f = tpmgr->factory_list.next;
+	while (f != &tpmgr->factory_list) {
+	    if (f->type == prm->tp_type)
+		break;
+	    f = f->next;
+	}
+
+	if (f != &tpmgr->factory_list) {
+	    if (prm->local_if) {
+		status = get_net_interface(f->type, &prm->dst_host,
+					   &tmp_str);
+		if (status == PJ_SUCCESS) {
+		    pj_strdup(pool, &prm->ret_addr, &tmp_str);
+		} else {
+		    /* It could fail "normally" on certain cases, e.g.
+		     * when connecting to IPv6 link local address, it
+		     * will wail with EINVAL.
+		     * In this case, fallback to use the default interface
+		     * rather than failing the call.
+		     */
+		    PJ_PERROR(5,(THIS_FILE, status, "Warning: unable to "
+			         "determine local interface"));
+		    pj_strdup(pool, &prm->ret_addr, &f->addr_name.host);
+		    status = PJ_SUCCESS;
+		}
+	    } else {
+		pj_strdup(pool, &prm->ret_addr, &f->addr_name.host);
+	    }
+	    prm->ret_port = (pj_uint16_t)f->addr_name.port;
+	    status = PJ_SUCCESS;
+	}
+	pj_lock_release(tpmgr->lock);
+    }
+
+on_return:
+    return status;
+}
+
+PJ_DEF(pj_status_t) pjsip_tpmgr_find_local_addr( pjsip_tpmgr *tpmgr,
+						 pj_pool_t *pool,
+						 pjsip_transport_type_e type,
+						 const pjsip_tpselector *sel,
+						 pj_str_t *ip_addr,
+						 int *port)
+{
+    pjsip_tpmgr_fla2_param prm;
+    pj_status_t status;
+
+    pjsip_tpmgr_fla2_param_default(&prm);
+    prm.tp_type = type;
+    prm.tp_sel = sel;
+
+    status = pjsip_tpmgr_find_local_addr2(tpmgr, pool, &prm);
+    if (status != PJ_SUCCESS)
+	return status;
+
+    *ip_addr = prm.ret_addr;
+    *port = prm.ret_port;
+
+    return PJ_SUCCESS;
+}
+
+/*
+ * Return number of transports currently registered to the transport
+ * manager.
+ */
+PJ_DEF(unsigned) pjsip_tpmgr_get_transport_count(pjsip_tpmgr *mgr)
+{
+    pj_hash_iterator_t itr_val;
+    pj_hash_iterator_t *itr;
+    int nr_of_transports = 0;
+
+    pj_lock_acquire(mgr->lock);
+
+    itr = pj_hash_first(mgr->table, &itr_val);
+    while (itr) {
+	transport *tp_entry = (transport *)pj_hash_this(mgr->table, itr);
+	nr_of_transports += pj_list_size(tp_entry);
+	itr = pj_hash_next(mgr->table, itr);
+    }
+
+    pj_lock_release(mgr->lock);
+
+    return nr_of_transports;
+}
+
+/*
+ * pjsip_tpmgr_destroy()
+ *
+ * Destroy transport manager.
+ */
+PJ_DEF(pj_status_t) pjsip_tpmgr_destroy( pjsip_tpmgr *mgr )
+{
+    pj_hash_iterator_t itr_val;
+    pj_hash_iterator_t *itr;
+    pjsip_tpfactory *factory;
+    pjsip_endpoint *endpt = mgr->endpt;
+
+    PJ_LOG(5, (THIS_FILE, "Destroying transport manager"));
+
+    pj_lock_acquire(mgr->lock);
+
+    /*
+     * Destroy all transports in the hash table.
      */
-    if (pj_scan_is_eof(scanner) || 
-	*scanner->curptr == '\r' || *scanner->curptr == '\n') 
+    for (itr = pj_hash_first(mgr->table, &itr_val); itr;
+	 itr = pj_hash_first(mgr->table, &itr_val))
     {
-	goto end;
+	transport *tp_ref;
+	tp_ref = pj_hash_this(mgr->table, itr);
+	destroy_transport(mgr, tp_ref->tp);
     }
 
-    if (hdr->count >= PJ_ARRAY_SIZE(hdr->values)) {
-	/* Too many elements */
-	on_syntax_error(scanner);
-	return;
+    /*
+     * Destroy all factories/listeners.
+     */
+    factory = mgr->factory_list.next;
+    while (factory != &mgr->factory_list) {
+	pjsip_tpfactory *next = factory->next;
+
+	factory->destroy(factory);
+
+	factory = next;
     }
 
-    pj_scan_get( scanner, &pconst.pjsip_NOT_COMMA_OR_NEWLINE, 
-		 &hdr->values[hdr->count]);
-    hdr->count++;
+    pj_lock_release(mgr->lock);
 
-    while ((hdr->count < PJSIP_GENERIC_ARRAY_MAX_COUNT) &&
-    	   (*scanner->curptr == ','))
-    {
-	pj_scan_get_char(scanner);
-	pj_scan_get( scanner, &pconst.pjsip_NOT_COMMA_OR_NEWLINE, 
-		     &hdr->values[hdr->count]);
-	hdr->count++;
+#if defined(PJ_DEBUG) && PJ_DEBUG!=0
+    /* If you encounter assert error on this line, it means there are
+     * leakings in transmit data (i.e. some transmit data have not been
+     * destroyed).
+     */
+    //pj_assert(pj_atomic_get(mgr->tdata_counter) == 0);
+    if (pj_atomic_get(mgr->tdata_counter) != 0) {
+	PJ_LOG(3,(THIS_FILE, "Warning: %d transmit buffer(s) not freed!",
+		  pj_atomic_get(mgr->tdata_counter)));
     }
+#endif
 
-end:
-    parse_hdr_end(scanner);
-}
-
-/* Parse generic array header. */
-PJ_DEF(void) pjsip_parse_generic_array_hdr_imp( pjsip_generic_array_hdr *hdr,
-						pj_scanner *scanner)
-{
-    parse_generic_array_hdr(hdr, scanner);
-}
-
-
-/* Parse generic string header. */
-static void parse_generic_string_hdr( pjsip_generic_string_hdr *hdr,
-				      pjsip_parse_ctx *ctx)
-{
-    pj_scanner *scanner = ctx->scanner;
-
-    hdr->hvalue.slen = 0;
-
-    /* header may be mangled hence the loop */
-    while (pj_cis_match(&pconst.pjsip_NOT_NEWLINE, *scanner->curptr)) {
-	pj_str_t next, tmp;
-
-	pj_scan_get( scanner, &pconst.pjsip_NOT_NEWLINE, &hdr->hvalue);
-	if (pj_scan_is_eof(scanner) || IS_NEWLINE(*scanner->curptr))
-	    break;
-	/* mangled, get next fraction */
-	pj_scan_get( scanner, &pconst.pjsip_NOT_NEWLINE, &next);
-	/* concatenate */
-	tmp.ptr = (char*)pj_pool_alloc(ctx->pool, 
-				       hdr->hvalue.slen + next.slen + 2);
-	tmp.slen = 0;
-	pj_strcpy(&tmp, &hdr->hvalue);
-	pj_strcat2(&tmp, " ");
-	pj_strcat(&tmp, &next);
-	tmp.ptr[tmp.slen] = '\0';
-
-	hdr->hvalue = tmp;
-    }
-
-    parse_hdr_end(scanner);
-}
-
-/* Parse generic integer header. */
-static void parse_generic_int_hdr( pjsip_generic_int_hdr *hdr,
-				   pj_scanner *scanner )
-{
-    pj_str_t tmp;
-    pj_scan_get( scanner, &pconst.pjsip_DIGIT_SPEC, &tmp);
-    hdr->ivalue = pj_strtoul(&tmp);
-    parse_hdr_end(scanner);
-}
-
-
-/* Parse Accept header. */
-static pjsip_hdr* parse_hdr_accept(pjsip_parse_ctx *ctx)
-{
-    PJ_LOG(1, ("Martin:", "check syntax on header field: Accept !...from:sip_parser.c:int_parse_msg()"));
-    pjsip_accept_hdr *accept = pjsip_accept_hdr_create(ctx->pool);
-    parse_generic_array_hdr(accept, ctx->scanner);
-    return (pjsip_hdr*)accept;
-}
-
-/* Parse Allow header. */
-static pjsip_hdr* parse_hdr_allow(pjsip_parse_ctx *ctx)
-{
-    PJ_LOG(1, ("Martin:", "check syntax on header field: Allow !...from:sip_parser.c:int_parse_msg()"));
-    pjsip_allow_hdr *allow = pjsip_allow_hdr_create(ctx->pool);
-    parse_generic_array_hdr(allow, ctx->scanner);
-    return (pjsip_hdr*)allow;
-}
-
-/* Parse Call-ID header. */
-static pjsip_hdr* parse_hdr_call_id(pjsip_parse_ctx *ctx)
-{
-    PJ_LOG(1, ("Martin:", "check syntax on header field: Caller-ID !...from:sip_parser.c:int_parse_msg()"));
-    pjsip_cid_hdr *hdr = pjsip_cid_hdr_create(ctx->pool);
-    pj_scan_get( ctx->scanner, &pconst.pjsip_NOT_NEWLINE, &hdr->id);
-    parse_hdr_end(ctx->scanner);
-
-    if (ctx->rdata)
-        ctx->rdata->msg_info.cid = hdr;
-
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse and interpret Contact param. */
-static void int_parse_contact_param( pjsip_contact_hdr *hdr, 
-				     pj_scanner *scanner,
-				     pj_pool_t *pool)
-{
-    while ( *scanner->curptr == ';' ) {
-	pj_str_t pname, pvalue;
-
-	int_parse_param( scanner, pool, &pname, &pvalue, 0);
-	if (!parser_stricmp(pname, pconst.pjsip_Q_STR) && pvalue.slen) {
-	    char *dot_pos = (char*) pj_memchr(pvalue.ptr, '.', pvalue.slen);
-	    if (!dot_pos) {
-		strtoi_validate(&pvalue, PJSIP_MIN_Q1000, PJSIP_MAX_Q1000,
-                                &hdr->q1000);
-		hdr->q1000 *= 1000;
-	    } else {
-		pj_str_t tmp = pvalue;
-		unsigned long qval_frac;
-
-		tmp.slen = dot_pos - pvalue.ptr;
-		strtoi_validate(&tmp, PJSIP_MIN_Q1000, PJSIP_MAX_Q1000,
-                                &hdr->q1000);
-                hdr->q1000 *= 1000;
-
-		pvalue.slen = (pvalue.ptr+pvalue.slen) - (dot_pos+1);
-		pvalue.ptr = dot_pos + 1;
-		if (pvalue.slen > 3) {
-		    pvalue.slen = 3;
-		}
-		qval_frac = pj_strtoul_mindigit(&pvalue, 3);
-		if ((unsigned)hdr->q1000 > (PJ_MAXINT32 - qval_frac)) {
-		    PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
-		}
-		hdr->q1000 += qval_frac;
-	    }    
-	} else if (!parser_stricmp(pname, pconst.pjsip_EXPIRES_STR) && 
-                   pvalue.slen) 
-        {
-            hdr->expires = pj_strtoul(&pvalue);
-            if (hdr->expires == PJSIP_EXPIRES_NOT_SPECIFIED)
-        	hdr->expires--;
-            if (hdr->expires > PJSIP_MAX_EXPIRES)
-            	hdr->expires = PJSIP_MAX_EXPIRES;
-            if (hdr->expires < PJSIP_MIN_EXPIRES)
-            	hdr->expires = PJSIP_MIN_EXPIRES;
-	} else {
-	    pjsip_param *p = PJ_POOL_ALLOC_T(pool, pjsip_param);
-	    p->name = pname;
-	    p->value = pvalue;
-	    pj_list_insert_before(&hdr->other_param, p);
+    /*
+     * Destroy any dangling transmit buffer.
+     */
+    if (!pj_list_empty(&mgr->tdata_list)) {
+	pjsip_tx_data *tdata = mgr->tdata_list.next;
+	while (tdata != &mgr->tdata_list) {
+	    pjsip_tx_data *next = tdata->next;
+	    tx_data_destroy(tdata);
+	    tdata = next;
 	}
-    }
-}
-
-/* Parse Contact header. */
-static pjsip_hdr* parse_hdr_contact( pjsip_parse_ctx *ctx )
-{
-    PJ_LOG(1, ("Martin:", "check syntax on header field: Contact !...from:sip_parser.c:int_parse_msg()"));
-    pjsip_contact_hdr *first = NULL;
-    pj_scanner *scanner = ctx->scanner;
-    
-    do {
-	pjsip_contact_hdr *hdr = pjsip_contact_hdr_create(ctx->pool);
-	if (first == NULL)
-	    first = hdr;
-	else
-	    pj_list_insert_before(first, hdr);
-
-	if (*scanner->curptr == '*') {
-	    pj_scan_get_char(scanner);
-	    hdr->star = 1;
-
-	} else {
-	    hdr->star = 0;
-	    hdr->uri = int_parse_uri_or_name_addr(scanner, ctx->pool, 
-                                                  PJSIP_PARSE_URI_AS_NAMEADDR |
-						  PJSIP_PARSE_URI_IN_FROM_TO_HDR);
-
-	    int_parse_contact_param(hdr, scanner, ctx->pool);
-	}
-
-	if (*scanner->curptr != ',')
-	    break;
-
-	pj_scan_get_char(scanner);
-
-    } while (1);
-
-    parse_hdr_end(scanner);
-
-    return (pjsip_hdr*)first;
-}
-
-/* Parse Content-Length header. */
-static pjsip_hdr* parse_hdr_content_len( pjsip_parse_ctx *ctx )
-{
-    PJ_LOG(1, ("Martin:", "check syntax on header field: Content-Length !...from:sip_parser.c:int_parse_msg()"));
-    pj_str_t digit;
-    pjsip_clen_hdr *hdr;
-
-    hdr = pjsip_clen_hdr_create(ctx->pool);
-    pj_scan_get(ctx->scanner, &pconst.pjsip_DIGIT_SPEC, &digit);
-    hdr->len = pj_strtoul(&digit);
-    parse_hdr_end(ctx->scanner);
-
-    if (ctx->rdata)
-        ctx->rdata->msg_info.clen = hdr;
-
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse Content-Type header. */
-static pjsip_hdr* parse_hdr_content_type( pjsip_parse_ctx *ctx )
-{
-    PJ_LOG(1, ("Martin:", "check syntax on header field: Content-Type !...from:sip_parser.c:int_parse_msg()"));
-    pjsip_ctype_hdr *hdr;
-    pj_scanner *scanner = ctx->scanner;
-
-    hdr = pjsip_ctype_hdr_create(ctx->pool);
-    
-    /* Parse media type and subtype. */
-    pj_scan_get(scanner, &pconst.pjsip_TOKEN_SPEC, &hdr->media.type);
-    pj_scan_get_char(scanner);
-    pj_scan_get(scanner, &pconst.pjsip_TOKEN_SPEC, &hdr->media.subtype);
-
-    /* Parse media parameters */
-    while (*scanner->curptr == ';') {
-	pjsip_param *param = PJ_POOL_ALLOC_T(ctx->pool, pjsip_param);
-	int_parse_param(scanner, ctx->pool, &param->name, &param->value, 0);
-	pj_list_push_back(&hdr->media.param, param);
+	PJ_LOG(3,(THIS_FILE, "Cleaned up dangling transmit buffer(s)."));
     }
 
-    parse_hdr_end(ctx->scanner);
+#if defined(PJ_DEBUG) && PJ_DEBUG!=0
+    pj_atomic_destroy(mgr->tdata_counter);
+#endif
 
-    if (ctx->rdata)
-        ctx->rdata->msg_info.ctype = hdr;
+    pj_lock_destroy(mgr->lock);
 
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse CSeq header. */
-static pjsip_hdr* parse_hdr_cseq( pjsip_parse_ctx *ctx )
-{
-    PJ_LOG(1, ("Martin:", "check syntax on header field: Cseq !...from:sip_parser.c:int_parse_msg()"));
-    pj_str_t cseq, method;
-    pjsip_cseq_hdr *hdr = NULL;
-    int cseq_val = 0;
-
-    pj_scan_get( ctx->scanner, &pconst.pjsip_DIGIT_SPEC, &cseq);
-    strtoi_validate(&cseq, PJSIP_MIN_CSEQ, PJSIP_MAX_CSEQ, &cseq_val);
-
-    hdr = pjsip_cseq_hdr_create(ctx->pool);
-    hdr->cseq = cseq_val;
-
-    pj_scan_get( ctx->scanner, &pconst.pjsip_TOKEN_SPEC, &method);
-    parse_hdr_end( ctx->scanner );
-
-    pjsip_method_init_np(&hdr->method, &method);
-    if (ctx->rdata) {
-        ctx->rdata->msg_info.cseq = hdr;
+    /* Unregister mod_msg_print. */
+    if (mod_msg_print.id != -1) {
+	pjsip_endpt_unregister_module(endpt, &mod_msg_print);
     }
 
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse Expires header. */
-static pjsip_hdr* parse_hdr_expires(pjsip_parse_ctx *ctx)
-{
-    PJ_LOG(1, ("Martin:", "check syntax on header field: Expires !...from:sip_parser.c:int_parse_msg()"));
-    pjsip_expires_hdr *hdr = pjsip_expires_hdr_create(ctx->pool, 0);
-    parse_generic_int_hdr(hdr, ctx->scanner);
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse From: or To: header. */
-static void parse_hdr_fromto( pj_scanner *scanner, 
-			      pj_pool_t *pool, 
-			      pjsip_from_hdr *hdr)
-{
-    PJ_LOG(1, ("Martin:", "check syntax on header field: From or To !...from:sip_parser.c:int_parse_msg()"));
-    hdr->uri = int_parse_uri_or_name_addr(scanner, pool, 
-					  PJSIP_PARSE_URI_AS_NAMEADDR |
-					  PJSIP_PARSE_URI_IN_FROM_TO_HDR);
-
-    while ( *scanner->curptr == ';' ) {
-	pj_str_t pname, pvalue;
-
-	int_parse_param( scanner, pool, &pname, &pvalue, 0);
-
-	if (!parser_stricmp(pname, pconst.pjsip_TAG_STR)) {
-	    hdr->tag = pvalue;
-	    
-	} else {
-	    pjsip_param *p = PJ_POOL_ALLOC_T(pool, pjsip_param);
-	    p->name = pname;
-	    p->value = pvalue;
-	    pj_list_insert_before(&hdr->other_param, p);
-	}
+    if (mgr->pool) {
+	pjsip_endpt_release_pool( mgr->endpt, mgr->pool );
     }
-
-    parse_hdr_end(scanner);
-}
-
-/* Parse From: header. */
-static pjsip_hdr* parse_hdr_from( pjsip_parse_ctx *ctx )
-{
-    pjsip_from_hdr *hdr = pjsip_from_hdr_create(ctx->pool);
-    parse_hdr_fromto(ctx->scanner, ctx->pool, hdr);
-    if (ctx->rdata)
-        ctx->rdata->msg_info.from = hdr;
-
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse Require: header. */
-static pjsip_hdr* parse_hdr_require( pjsip_parse_ctx *ctx )
-{
-    pjsip_require_hdr *hdr;
-    pj_bool_t new_hdr = (ctx->rdata==NULL ||
-			 ctx->rdata->msg_info.require == NULL);
-    
-    if (ctx->rdata && ctx->rdata->msg_info.require) {
-	hdr = ctx->rdata->msg_info.require;
-    } else {
-	hdr = pjsip_require_hdr_create(ctx->pool);
-	if (ctx->rdata)
-	    ctx->rdata->msg_info.require = hdr;
-    }
-
-    parse_generic_array_hdr(hdr, ctx->scanner);
-
-    return new_hdr ? (pjsip_hdr*)hdr : NULL;
-}
-
-/* Parse Retry-After: header. */
-static pjsip_hdr* parse_hdr_retry_after(pjsip_parse_ctx *ctx)
-{
-    pjsip_retry_after_hdr *hdr;
-    pj_scanner *scanner = ctx->scanner;
-    pj_str_t tmp;
-
-    hdr = pjsip_retry_after_hdr_create(ctx->pool, 0);
-    
-    pj_scan_get(scanner, &pconst.pjsip_DIGIT_SPEC, &tmp);
-    strtoi_validate(&tmp, PJSIP_MIN_RETRY_AFTER, PJSIP_MAX_RETRY_AFTER,
-                    &hdr->ivalue);
-
-    while (!pj_scan_is_eof(scanner) && *scanner->curptr!='\r' &&
-	   *scanner->curptr!='\n')
-    {
-	if (*scanner->curptr=='(') {
-	    pj_scan_get_quote(scanner, '(', ')', &hdr->comment);
-	    /* Trim the leading and ending parens */
-	    hdr->comment.ptr++;
-	    hdr->comment.slen -= 2;
-	} else if (*scanner->curptr==';') {
-	    pjsip_param *prm = PJ_POOL_ALLOC_T(ctx->pool, pjsip_param);
-	    int_parse_param(scanner, ctx->pool, &prm->name, &prm->value, 0);
-	    pj_list_push_back(&hdr->param, prm);
-	} else {
-	    on_syntax_error(scanner);
-	}
-    }
-
-    parse_hdr_end(scanner);
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse Supported: header. */
-static pjsip_hdr* parse_hdr_supported(pjsip_parse_ctx *ctx)
-{
-    pjsip_supported_hdr *hdr;
-    pj_bool_t new_hdr = (ctx->rdata==NULL || 
-		         ctx->rdata->msg_info.supported == NULL);
-
-    if (ctx->rdata && ctx->rdata->msg_info.supported) {
-	hdr = ctx->rdata->msg_info.supported;
-    } else {
-	hdr = pjsip_supported_hdr_create(ctx->pool);
-	if (ctx->rdata)
-	    ctx->rdata->msg_info.supported = hdr;
-    }
-
-    parse_generic_array_hdr(hdr, ctx->scanner);
-    return new_hdr ? (pjsip_hdr*)hdr : NULL;
-}
-
-/* Parse To: header. */
-static pjsip_hdr* parse_hdr_to( pjsip_parse_ctx *ctx )
-{
-    pjsip_to_hdr *hdr = pjsip_to_hdr_create(ctx->pool);
-    parse_hdr_fromto(ctx->scanner, ctx->pool, hdr);
-
-    if (ctx->rdata)
-        ctx->rdata->msg_info.to = hdr;
-
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse Unsupported: header. */
-static pjsip_hdr* parse_hdr_unsupported(pjsip_parse_ctx *ctx)
-{
-    pjsip_unsupported_hdr *hdr = pjsip_unsupported_hdr_create(ctx->pool);
-    parse_generic_array_hdr(hdr, ctx->scanner);
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse and interpret Via parameters. */
-static void int_parse_via_param( pjsip_via_hdr *hdr, pj_scanner *scanner,
-				 pj_pool_t *pool)
-{
-    while ( *scanner->curptr == ';' ) {
-	pj_str_t pname, pvalue;
-
-	//Parse with PARAM_CHAR instead, to allow IPv6
-	//No, back to using int_parse_param() for the "`" character!
-	//int_parse_param( scanner, pool, &pname, &pvalue, 0);
-	//parse_param_imp(scanner, pool, &pname, &pvalue, 
-	//		&pconst.pjsip_TOKEN_SPEC,
-	//		&pconst.pjsip_TOKEN_SPEC_ESC, 0);
-	//int_parse_param(scanner, pool, &pname, &pvalue, 0);
-	// This should be the correct one:
-	//  added special spec for Via parameter, basically token plus
-	//  ":" to allow IPv6 address in the received param.
-	pj_scan_get_char(scanner);
-	parse_param_imp(scanner, pool, &pname, &pvalue,
-			&pconst.pjsip_VIA_PARAM_SPEC,
-			&pconst.pjsip_VIA_PARAM_SPEC_ESC,
-			0);
-
-	if (!parser_stricmp(pname, pconst.pjsip_BRANCH_STR) && pvalue.slen) {
-	    hdr->branch_param = pvalue;
-
-	} else if (!parser_stricmp(pname, pconst.pjsip_TTL_STR) && pvalue.slen) {
-	    strtoi_validate(&pvalue, PJSIP_MIN_TTL, PJSIP_MAX_TTL,
-                            &hdr->ttl_param);
-	    
-	} else if (!parser_stricmp(pname, pconst.pjsip_MADDR_STR) && pvalue.slen) {
-	    hdr->maddr_param = pvalue;
-
-	} else if (!parser_stricmp(pname, pconst.pjsip_RECEIVED_STR) && pvalue.slen) {
-	    hdr->recvd_param = pvalue;
-
-	} else if (!parser_stricmp(pname, pconst.pjsip_RPORT_STR)) {
-	    if (pvalue.slen) {
-		strtoi_validate(&pvalue, PJSIP_MIN_PORT, PJSIP_MAX_PORT,
-			        &hdr->rport_param);
-            } else
-		hdr->rport_param = 0;
-	} else {
-	    pjsip_param *p = PJ_POOL_ALLOC_T(pool, pjsip_param);
-	    p->name = pname;
-	    p->value = pvalue;
-	    pj_list_insert_before(&hdr->other_param, p);
-	}
-    }
-}
-
-/* Parse Max-Forwards header. */
-static pjsip_hdr* parse_hdr_max_forwards( pjsip_parse_ctx *ctx )
-{
-    pjsip_max_fwd_hdr *hdr;
-    hdr = pjsip_max_fwd_hdr_create(ctx->pool, 0);
-    parse_generic_int_hdr(hdr, ctx->scanner);
-
-    if (ctx->rdata)
-        ctx->rdata->msg_info.max_fwd = hdr;
-
-    return (pjsip_hdr*)hdr;
-}
-
-/* Parse Min-Expires header. */
-static pjsip_hdr* parse_hdr_min_expires(pjsip_parse_ctx *ctx)
-{
-    pjsip_min_expires_hdr *hdr;
-    hdr = pjsip_min_expires_hdr_create(ctx->pool, 0);
-    parse_generic_int_hdr(hdr, ctx->scanner);
-    return (pjsip_hdr*)hdr;
-}
-
-
-/* Parse Route: or Record-Route: header. */
-static void parse_hdr_rr_route( pj_scanner *scanner, pj_pool_t *pool,
-				pjsip_routing_hdr *hdr )
-{
-    pjsip_name_addr *temp=int_parse_name_addr(scanner, pool);
-
-    pj_memcpy(&hdr->name_addr, temp, sizeof(*temp));
-
-    while (*scanner->curptr == ';') {
-	pjsip_param *p = PJ_POOL_ALLOC_T(pool, pjsip_param);
-	int_parse_param(scanner, pool, &p->name, &p->value, 0);
-	pj_list_insert_before(&hdr->other_param, p);
-    }
-}
-
-/* Parse Record-Route header. */
-static pjsip_hdr* parse_hdr_rr( pjsip_parse_ctx *ctx)
-{
-    pjsip_rr_hdr *first = NULL;
-    pj_scanner *scanner = ctx->scanner;
-
-    do {
-	pjsip_rr_hdr *hdr = pjsip_rr_hdr_create(ctx->pool);
-	if (!first) {
-	    first = hdr;
-	} else {
-	    pj_list_insert_before(first, hdr);
-	}
-	parse_hdr_rr_route(scanner, ctx->pool, hdr);
-	if (*scanner->curptr == ',') {
-	    pj_scan_get_char(scanner);
-	} else {
-	    break;
-	}
-    } while (1);
-    parse_hdr_end(scanner);
-
-    if (ctx->rdata && ctx->rdata->msg_info.record_route==NULL)
-        ctx->rdata->msg_info.record_route = first;
-
-    return (pjsip_hdr*)first;
-}
-
-/* Parse Route: header. */
-static pjsip_hdr* parse_hdr_route( pjsip_parse_ctx *ctx )
-{
-    pjsip_route_hdr *first = NULL;
-    pj_scanner *scanner = ctx->scanner;
-
-    do {
-	pjsip_route_hdr *hdr = pjsip_route_hdr_create(ctx->pool);
-	if (!first) {
-	    first = hdr;
-	} else {
-	    pj_list_insert_before(first, hdr);
-	}
-	parse_hdr_rr_route(scanner, ctx->pool, hdr);
-	if (*scanner->curptr == ',') {
-	    pj_scan_get_char(scanner);
-	} else {
-	    break;
-	}
-    } while (1);
-    parse_hdr_end(scanner);
-
-    if (ctx->rdata && ctx->rdata->msg_info.route==NULL)
-        ctx->rdata->msg_info.route = first;
-
-    return (pjsip_hdr*)first;
-}
-
-/* Parse Via: header. */
-static pjsip_hdr* parse_hdr_via( pjsip_parse_ctx *ctx )
-{
-    pjsip_via_hdr *first = NULL;
-    pj_scanner *scanner = ctx->scanner;
-
-    do {
-	pjsip_via_hdr *hdr = pjsip_via_hdr_create(ctx->pool);
-	if (!first)
-	    first = hdr;
-	else
-	    pj_list_insert_before(first, hdr);
-
-	parse_sip_version(scanner);
-	if (pj_scan_get_char(scanner) != '/')
-	    on_syntax_error(scanner);
-
-	pj_scan_get( scanner, &pconst.pjsip_TOKEN_SPEC, &hdr->transport);
-	int_parse_host(scanner, &hdr->sent_by.host);
-
-	if (*scanner->curptr==':') {
-	    pj_str_t digit;
-	    pj_scan_get_char(scanner);
-	    pj_scan_get(scanner, &pconst.pjsip_DIGIT_SPEC, &digit);
-	    strtoi_validate(&digit, PJSIP_MIN_PORT, PJSIP_MAX_PORT,
-                            &hdr->sent_by.port);
-	}
-	
-	int_parse_via_param(hdr, scanner, ctx->pool);
-
-	if (*scanner->curptr == '(') {
-	    pj_scan_get_char(scanner);
-	    pj_scan_get_until_ch( scanner, ')', &hdr->comment);
-	    pj_scan_get_char( scanner );
-	}
-
-	if (*scanner->curptr != ',')
-	    break;
-
-	pj_scan_get_char(scanner);
-
-    } while (1);
-
-    parse_hdr_end(scanner);
-
-    if (ctx->rdata && ctx->rdata->msg_info.via == NULL)
-        ctx->rdata->msg_info.via = first;
-
-    return (pjsip_hdr*)first;
-}
-
-/* Parse generic header. */
-static pjsip_hdr* parse_hdr_generic_string( pjsip_parse_ctx *ctx )
-{
-    pjsip_generic_string_hdr *hdr;
-
-    hdr = pjsip_generic_string_hdr_create(ctx->pool, NULL, NULL);
-    parse_generic_string_hdr(hdr, ctx);
-    return (pjsip_hdr*)hdr;
-
-}
-
-/* Public function to parse a header value. */
-PJ_DEF(void*) pjsip_parse_hdr( pj_pool_t *pool, const pj_str_t *hname,
-			       char *buf, pj_size_t size, int *parsed_len )
-{
-    pj_scanner scanner;
-    pjsip_hdr *hdr = NULL;
-    pjsip_parse_ctx context;
-    PJ_USE_EXCEPTION;
-
-    pj_scan_init(&scanner, buf, size, PJ_SCAN_AUTOSKIP_WS_HEADER, 
-                 &on_syntax_error);
-
-    context.scanner = &scanner;
-    context.pool = pool;
-    context.rdata = NULL;
-
-    PJ_TRY {
-	pjsip_parse_hdr_func *func = find_handler(hname);
-	if (func) {
-	    hdr = (*func)(&context);
-	} else {
-	    hdr = parse_hdr_generic_string(&context);
-	    hdr->type = PJSIP_H_OTHER;
-	    pj_strdup(pool, &hdr->name, hname);
-	    hdr->sname = hdr->name;
-	}
-
-    } 
-    PJ_CATCH_ANY {
-	hdr = NULL;
-    }
-    PJ_END
-
-    if (parsed_len) {
-	*parsed_len = (unsigned)(scanner.curptr - scanner.begin);
-    }
-
-    pj_scan_fini(&scanner);
-
-    return hdr;
-}
-
-/* Parse multiple header lines */
-PJ_DEF(pj_status_t) pjsip_parse_headers( pj_pool_t *pool, char *input,
-				         pj_size_t size, pjsip_hdr *hlist,
-				         unsigned options)
-{
-    enum { STOP_ON_ERROR = 1 };
-    pj_str_t hname;
-    pj_scanner scanner;
-    pjsip_parse_ctx ctx;
-
-    PJ_USE_EXCEPTION;
-
-    pj_scan_init(&scanner, input, size, PJ_SCAN_AUTOSKIP_WS_HEADER,
-                 &on_syntax_error);
-
-    pj_bzero(&ctx, sizeof(ctx));
-    ctx.scanner = &scanner;
-    ctx.pool = pool;
-
-retry_parse:
-    PJ_TRY
-    {
-	/* Parse headers. */
-	do {
-	    pjsip_parse_hdr_func * func;
-	    pjsip_hdr *hdr = NULL;
-
-	    /* Init hname just in case parsing fails.
-	     * Ref: PROTOS #2412
-	     */
-	    hname.slen = 0;
-
-	    /* Get hname. */            
-	    pj_scan_get( &scanner, &pconst.pjsip_TOKEN_SPEC, &hname);
-	    if (pj_scan_get_char( &scanner ) != ':') {
-		PJ_THROW(PJSIP_SYN_ERR_EXCEPTION);
-	    }
-
-	    /* Find handler. */
-	    func = find_handler(&hname);
-
-	    /* Call the handler if found.
-	     * If no handler is found, then treat the header as generic
-	     * hname/hvalue pair.
-	     */
-	    if (func) {
-		hdr = (*func)(&ctx);
-	    } else {
-		hdr = parse_hdr_generic_string(&ctx);
-		hdr->name = hdr->sname = hname;
-	    }
-
-	    /* Single parse of header line can produce multiple headers.
-	     * For example, if one Contact: header contains Contact list
-	     * separated by comma, then these Contacts will be split into
-	     * different Contact headers.
-	     * So here we must insert list instead of just insert one header.
-	     */
-	    if (hdr)
-		pj_list_insert_nodes_before(hlist, hdr);
-
-	    /* Parse until EOF or an empty line is found. */
-	} while (!pj_scan_is_eof(&scanner) && !IS_NEWLINE(*scanner.curptr));
-
-	/* If empty line is found, eat it. */
-	if (!pj_scan_is_eof(&scanner)) {
-	    if (IS_NEWLINE(*scanner.curptr)) {
-		pj_scan_get_newline(&scanner);
-	    }
-	}
-    }
-    PJ_CATCH_ANY
-    {
-	PJ_LOG(4,(THIS_FILE, "Error parsing header: '%.*s' line %d col %d",
-		  (int)hname.slen, hname.ptr, scanner.line,
-		  pj_scan_get_col(&scanner)));
-
-	/* Exception was thrown during parsing. */
-	if ((options & STOP_ON_ERROR) == STOP_ON_ERROR) {
-	    pj_scan_fini(&scanner);
-	    return PJSIP_EINVALIDHDR;
-	}
-
-	/* Skip until newline, and parse next header. */
-	if (!pj_scan_is_eof(&scanner)) {
-	    /* Skip until next line.
-	     * Watch for header continuation.
-	     */
-	    do {
-		pj_scan_skip_line(&scanner);
-	    } while (IS_SPACE(*scanner.curptr));
-	}
-
-	/* Restore flag. Flag may be set in int_parse_sip_url() */
-	scanner.skip_ws = PJ_SCAN_AUTOSKIP_WS_HEADER;
-
-	/* Continue parse next header, if any. */
-	if (!pj_scan_is_eof(&scanner) && !IS_NEWLINE(*scanner.curptr)) {
-	    goto retry_parse;
-	}
-
-    }
-    PJ_END;
 
     return PJ_SUCCESS;
 }
 
+/*Martin 2021-03-11*/
+/*当收到一个sip message的时候，transport调用pjsip_tpmgr_receive_packet()函数进行处理*/
+
+/*
+ * pjsip_tpmgr_receive_packet()
+ *
+ * Called by tranports when they receive a new packet.
+ */
+PJ_DEF(pj_ssize_t) pjsip_tpmgr_receive_packet( pjsip_tpmgr *mgr,
+					       pjsip_rx_data *rdata)
+{
+    /*tp_info.transport就是接收到这个sip message的那个transport*/
+    PJ_LOG(1, ("Martin:", "You got a new sip message!...from:sip_transport.c:pjsip_tpmgr_receive_packet()"));
+    pjsip_transport *tr = rdata->tp_info.transport;
+    
+    char *current_pkt;
+    pj_size_t remaining_len;
+    pj_size_t total_processed = 0;
+
+    /* Check size. */
+    pj_assert(rdata->pkt_info.len > 0);
+    if (rdata->pkt_info.len <= 0)
+	return -1;
+
+    current_pkt = rdata->pkt_info.packet;
+    remaining_len = rdata->pkt_info.len;
+
+    tr->last_recv_len = rdata->pkt_info.len;
+    pj_get_timestamp(&tr->last_recv_ts);
+    
+    /* Must NULL terminate buffer. This is the requirement of the 
+     * parser etc. 
+     */
+    current_pkt[remaining_len] = '\0';
+
+    /* Process all message fragments. */
+    while (remaining_len > 0) {
+
+	pjsip_msg *msg;
+	char *p, *end;
+	char saved;
+	pj_size_t msg_fragment_size;
+
+	/*newlines就是换行，/n这种，要去掉，函数处理不了*/
+	/* Skip leading newlines as pjsip_find_msg() currently can't
+	 * handle leading newlines.
+	 */
+	for (p=current_pkt, end=p+remaining_len; p!=end; ++p) {
+	    if (*p != '\r' && *p != '\n')
+		break;
+	}
+	if (p!=current_pkt) {
+	    remaining_len -= (p - current_pkt);
+	    total_processed += (p - current_pkt);
+
+	    /* Notify application about the dropped newlines */
+	    if (mgr->tp_drop_data_cb) {
+		pjsip_tp_dropped_data dd;
+		pj_bzero(&dd, sizeof(dd));
+		dd.tp = tr;
+		dd.data = current_pkt;
+		dd.len = p - current_pkt;
+		dd.status = PJ_EIGNORED;
+		(*mgr->tp_drop_data_cb)(&dd);
+	    }
+
+	    current_pkt = p;
+	    if (remaining_len == 0) {
+		return total_processed;
+	    }
+	}
+
+	/* Initialize default fragment size. */
+	msg_fragment_size = remaining_len;
+
+	/* Clear and init msg_info in rdata. 
+	 * Endpoint might inspect the values there when we call the callback
+	 * to report some errors.
+	 */
+	pj_bzero(&rdata->msg_info, sizeof(rdata->msg_info));
+	pj_list_init(&rdata->msg_info.parse_err);
+	rdata->msg_info.msg_buf = current_pkt;
+	rdata->msg_info.len = (int)remaining_len;
+
+	/* For TCP transport, check if the whole message has been received. */
+	if ((tr->flag & PJSIP_TRANSPORT_DATAGRAM) == 0) {
+	    pj_status_t msg_status;
+	    msg_status = pjsip_find_msg(current_pkt, remaining_len, PJ_FALSE, 
+                                        &msg_fragment_size);
+	    if (msg_status != PJ_SUCCESS) {
+		if (remaining_len == PJSIP_MAX_PKT_LEN) {
+		    mgr->on_rx_msg(mgr->endpt, PJSIP_ERXOVERFLOW, rdata);
+		    
+		    /* Notify application about the message overflow */
+	    	    if (mgr->tp_drop_data_cb) {
+			pjsip_tp_dropped_data dd;
+			pj_bzero(&dd, sizeof(dd));
+			dd.tp = tr;
+			dd.data = current_pkt;
+			dd.len = msg_fragment_size;
+			dd.status = PJSIP_ERXOVERFLOW;
+			(*mgr->tp_drop_data_cb)(&dd);
+	    	    }
+		    
+		    /* Exhaust all data. */
+		    return rdata->pkt_info.len;
+		} else {
+		    /* Not enough data in packet. */
+		    return total_processed;
+		}
+	    }
+	}
+
+	/* Update msg_info. */
+	rdata->msg_info.len = (int)msg_fragment_size;
+
+	/* Null terminate packet */
+	saved = current_pkt[msg_fragment_size];
+	current_pkt[msg_fragment_size] = '\0';
+
+    /*Martin 2021-03-11*/
+	/*调用pjsip_parse_rdata对sip消息的语法问题进行检查*/
+	/* Parse the message. */
+	rdata->msg_info.msg = msg = 
+	    pjsip_parse_rdata( current_pkt, msg_fragment_size, rdata);
+
+	/* Restore null termination */
+	current_pkt[msg_fragment_size] = saved;
+
+	/* Check for parsing syntax error */
+	if (msg==NULL || !pj_list_empty(&rdata->msg_info.parse_err)) {
+	    pjsip_parser_err_report *err;
+	    char buf[256];
+	    pj_str_t tmp;
+            PJ_LOG(1, ("Martin:", "The sip message got a syntax problem!...from:sip_transport.c:pjsip_tpmgr_receive_packet()"));
+	    /* Gather syntax error information */
+	    tmp.ptr = buf; tmp.slen = 0;
+	    err = rdata->msg_info.parse_err.next;
+	    while (err != &rdata->msg_info.parse_err) {
+		int len;
+		len = pj_ansi_snprintf(tmp.ptr+tmp.slen, sizeof(buf)-tmp.slen,
+				       ": %s exception when parsing '%.*s' "
+				       "header on line %d col %d",
+				       pj_exception_id_name(err->except_code),
+				       (int)err->hname.slen, err->hname.ptr,
+				       err->line, err->col);
+		if (len >= (int)sizeof(buf)-tmp.slen) {
+		    len = (int)sizeof(buf)-tmp.slen;
+		}
+		if (len > 0) {
+		    tmp.slen += len;
+		}
+		err = err->next;
+	    }
+
+	    /* Only print error message if there's error.
+	     * Sometimes we receive blank packets (packets with only CRLF)
+	     * which were sent to keep NAT bindings.
+	     */
+	    if (tmp.slen) {
+		PJ_LOG(1, (THIS_FILE, 
+		      "Error processing %d bytes packet from %s %s:%d %.*s:\n"
+		      "%.*s\n"
+		      "-- end of packet.",
+		      msg_fragment_size,
+		      rdata->tp_info.transport->type_name,
+		      rdata->pkt_info.src_name, 
+		      rdata->pkt_info.src_port,
+		      (int)tmp.slen, tmp.ptr,
+		      (int)msg_fragment_size,
+		      rdata->msg_info.msg_buf));
+	    }
+
+	    /* Notify application about the dropped data (syntax error) */
+	    if (tmp.slen && mgr->tp_drop_data_cb) {
+		pjsip_tp_dropped_data dd;
+		pj_bzero(&dd, sizeof(dd));
+		dd.tp = tr;
+		dd.data = current_pkt;
+		dd.len = msg_fragment_size;
+		dd.status = PJSIP_EINVALIDMSG;
+		(*mgr->tp_drop_data_cb)(&dd);
+		
+		if (dd.len > 0 && dd.len < msg_fragment_size)
+		    msg_fragment_size = dd.len;
+	    }
+
+	    goto finish_process_fragment;
+	}
+
+	/* Perform basic header checking. */
+	if (rdata->msg_info.cid == NULL ||
+	    rdata->msg_info.cid->id.slen == 0 || 
+	    rdata->msg_info.from == NULL || 
+	    rdata->msg_info.to == NULL || 
+	    rdata->msg_info.via == NULL || 
+	    rdata->msg_info.cseq == NULL) 
+	{
+	    mgr->on_rx_msg(mgr->endpt, PJSIP_EMISSINGHDR, rdata);
+
+	    /* Notify application about the missing header. */
+	    if (mgr->tp_drop_data_cb) {
+		pjsip_tp_dropped_data dd;
+		pj_bzero(&dd, sizeof(dd));
+		dd.tp = tr;
+		dd.data = current_pkt;
+		dd.len = msg_fragment_size;
+		dd.status = PJSIP_EMISSINGHDR;
+		(*mgr->tp_drop_data_cb)(&dd);	    
+	    }
+	    goto finish_process_fragment;
+	}
+
+	/* For request: */
+	if (rdata->msg_info.msg->type == PJSIP_REQUEST_MSG) {
+	    /* always add received parameter to the via. */
+	    pj_strdup2(rdata->tp_info.pool, 
+		       &rdata->msg_info.via->recvd_param, 
+		       rdata->pkt_info.src_name);
+
+	    /* RFC 3581:
+	     * If message contains "rport" param, put the received port there.
+	     */
+	    if (rdata->msg_info.via->rport_param == 0) {
+		rdata->msg_info.via->rport_param = rdata->pkt_info.src_port;
+	    }
+	} else {
+	    /* Drop malformed responses */
+	    if (rdata->msg_info.msg->line.status.code < 100 ||
+		rdata->msg_info.msg->line.status.code >= 700)
+	    {
+		mgr->on_rx_msg(mgr->endpt, PJSIP_EINVALIDSTATUS, rdata);
+
+		/* Notify application about the invalid status. */
+		if (mgr->tp_drop_data_cb) {
+		    pjsip_tp_dropped_data dd;
+		    pj_bzero(&dd, sizeof(dd));
+		    dd.tp = tr;
+		    dd.data = current_pkt;
+		    dd.len = msg_fragment_size;
+		    dd.status = PJSIP_EINVALIDSTATUS;
+		    (*mgr->tp_drop_data_cb)(&dd);	    
+		}
+		goto finish_process_fragment;
+	    }
+	}
+
+	/* Drop response message if it has more than one Via.
+	*/
+	/* This is wrong. Proxy DOES receive responses with multiple
+	 * Via headers! Thanks Aldo <acampi at deis.unibo.it> for pointing
+	 * this out.
+
+	if (msg->type == PJSIP_RESPONSE_MSG) {
+	    pjsip_hdr *hdr;
+	    hdr = (pjsip_hdr*)rdata->msg_info.via->next;
+	    if (hdr != &msg->hdr) {
+		hdr = pjsip_msg_find_hdr(msg, PJSIP_H_VIA, hdr);
+		if (hdr) {
+		    mgr->on_rx_msg(mgr->endpt, PJSIP_EMULTIPLEVIA, rdata);
+		    goto finish_process_fragment;
+		}
+	    }
+	}
+	*/
+
+	/* Call the transport manager's upstream message callback.
+	 */
+	mgr->on_rx_msg(mgr->endpt, PJ_SUCCESS, rdata);
+
+
+finish_process_fragment:
+	total_processed += msg_fragment_size;
+	current_pkt += msg_fragment_size;
+	remaining_len -= msg_fragment_size;
+
+    }	/* while (rdata->pkt_info.len > 0) */
+
+
+    return total_processed;
+}
+
+
+/*
+ * pjsip_tpmgr_acquire_transport()
+ *
+ * Get transport suitable to communicate to remote. Create a new one
+ * if necessary.
+ */
+PJ_DEF(pj_status_t) pjsip_tpmgr_acquire_transport(pjsip_tpmgr *mgr,
+						  pjsip_transport_type_e type,
+						  const pj_sockaddr_t *remote,
+						  int addr_len,
+						  const pjsip_tpselector *sel,
+						  pjsip_transport **tp)
+{
+    return pjsip_tpmgr_acquire_transport2(mgr, type, remote, addr_len, sel,
+					  NULL, tp);
+}
+
+
+/*
+ * pjsip_tpmgr_acquire_transport2()
+ *
+ * Get transport suitable to communicate to remote. Create a new one
+ * if necessary.
+ */
+PJ_DEF(pj_status_t) pjsip_tpmgr_acquire_transport2(pjsip_tpmgr *mgr,
+						   pjsip_transport_type_e type,
+						   const pj_sockaddr_t *remote,
+						   int addr_len,
+						   const pjsip_tpselector *sel,
+						   pjsip_tx_data *tdata,
+						   pjsip_transport **tp)
+{
+    pjsip_tpfactory *factory;
+    pj_status_t status;
+
+    TRACE_((THIS_FILE,"Acquiring transport type=%s, sel=%s remote=%s:%d",
+		       pjsip_transport_get_type_name(type),
+		       print_tpsel_info(sel),
+		       addr_string(remote),
+		       pj_sockaddr_get_port(remote)));
+
+    pj_lock_acquire(mgr->lock);
+
+    /* If transport is specified, then just use it if it is suitable
+     * for the destination.
+     */
+    if (sel && sel->type == PJSIP_TPSELECTOR_TRANSPORT &&
+	sel->u.transport) 
+    {
+	pjsip_transport *seltp = sel->u.transport;
+
+	/* See if the transport is (not) suitable */
+	if (seltp->key.type != type) {
+	    pj_lock_release(mgr->lock);
+	    TRACE_((THIS_FILE, "Transport type in tpsel not matched"));
+	    return PJSIP_ETPNOTSUITABLE;
+	}
+
+	/* We could also verify that the destination address is reachable
+	 * from this transport (i.e. both are equal), but if application
+	 * has requested a specific transport to be used, assume that
+	 * it knows what to do.
+	 *
+	 * In other words, I don't think destination verification is a good
+	 * idea for now.
+	 */
+
+	/* Transport looks to be suitable to use, so just use it. */
+	pjsip_transport_add_ref(seltp);
+	pj_lock_release(mgr->lock);
+	*tp = seltp;
+
+	TRACE_((THIS_FILE, "Transport %s acquired", seltp->obj_name));
+	return PJ_SUCCESS;
+
+    } else {
+
+	/*
+	 * This is the "normal" flow, where application doesn't specify
+	 * specific transport to be used to send message to.
+	 * In this case, lookup the transport from the hash table.
+	 */
+	pjsip_transport_key key;
+	int key_len;
+	pjsip_transport *tp_ref = NULL;
+	transport *tp_entry = NULL;
+
+
+	/* If listener is specified, verify that the listener type matches
+	 * the destination type.
+	 */
+	if (sel && sel->type == PJSIP_TPSELECTOR_LISTENER && sel->u.listener)
+	{
+	    if (sel->u.listener->type != type) {
+		pj_lock_release(mgr->lock);
+		TRACE_((THIS_FILE, "Listener type in tpsel not matched"));
+		return PJSIP_ETPNOTSUITABLE;
+	    }
+	}
+
+	if (!sel || sel->disable_connection_reuse == PJ_FALSE) {
+	    pj_bzero(&key, sizeof(key));
+	    key_len = sizeof(key.type) + addr_len;
+
+	    /* First try to get exact destination. */
+	    key.type = type;
+	    pj_memcpy(&key.rem_addr, remote, addr_len);
+
+	    tp_entry = (transport *)pj_hash_get(mgr->table, &key, key_len,
+						NULL);
+	    if (tp_entry) {
+		transport *tp_iter = tp_entry;
+		do {
+		    /* Don't use transport being shutdown */
+		    if (!tp_iter->tp->is_shutdown) {
+			if (sel && sel->type == PJSIP_TPSELECTOR_LISTENER &&
+			    sel->u.listener)
+			{
+			    /* Match listener if selector is set */
+			    if (tp_iter->tp->factory == sel->u.listener) {
+				tp_ref = tp_iter->tp;
+				break;
+			    }
+			} else {
+			    tp_ref = tp_iter->tp;
+			    break;
+			}
+		    }
+		    tp_iter = tp_iter->next;
+		} while (tp_iter != tp_entry);
+	    }
+	}
+
+	if (tp_ref == NULL &&
+	    (!sel || sel->disable_connection_reuse == PJ_FALSE))
+	{
+	    unsigned flag = pjsip_transport_get_flag_from_type(type);
+	    const pj_sockaddr *remote_addr = (const pj_sockaddr*)remote;
+
+
+	    /* Ignore address for loop transports. */
+	    if (type == PJSIP_TRANSPORT_LOOP ||
+		type == PJSIP_TRANSPORT_LOOP_DGRAM)
+	    {
+		pj_sockaddr *addr = &key.rem_addr;
+
+		pj_bzero(addr, addr_len);
+		key_len = sizeof(key.type) + addr_len;
+		tp_entry = (transport *) pj_hash_get(mgr->table, &key,
+						     key_len, NULL);
+		if (tp_entry) {
+		    tp_ref = tp_entry->tp;
+		}
+	    }
+	    /* For datagram transports, try lookup with zero address.
+	     */
+	    else if (flag & PJSIP_TRANSPORT_DATAGRAM)
+	    {
+		pj_sockaddr *addr = &key.rem_addr;
+
+		pj_bzero(addr, addr_len);
+		addr->addr.sa_family = remote_addr->addr.sa_family;
+
+		key_len = sizeof(key.type) + addr_len;
+		tp_entry = (transport *) pj_hash_get(mgr->table, &key,
+						     key_len, NULL);
+		if (tp_entry) {
+		    tp_ref = tp_entry->tp;
+		}
+	    }
+	}
+
+	/* If transport is found and listener is specified, verify listener */
+	else if (sel && sel->type == PJSIP_TPSELECTOR_LISTENER &&
+		 sel->u.listener && tp_ref->factory != sel->u.listener)
+	{
+	    tp_ref = NULL;
+	    /* This will cause a new transport to be created which will be a
+	     * 'duplicate' of the existing transport (same type & remote addr,
+	     * but different factory).
+	     */
+	    TRACE_((THIS_FILE, "Transport found but from different listener"));
+	}
+
+	if (tp_ref!=NULL && !tp_ref->is_shutdown) {
+	    /*
+	     * Transport found!
+	     */
+	    pjsip_transport_add_ref(tp_ref);
+	    pj_lock_release(mgr->lock);
+	    *tp = tp_ref;
+
+	    TRACE_((THIS_FILE, "Transport %s acquired", tp_ref->obj_name));
+	    return PJ_SUCCESS;
+	}
+
+
+	/*
+	 * Either transport not found, or we don't want to use the existing
+	 * transport (such as in the case of different factory or
+	 * if connection reuse is disabled). So we need to create one,
+	 * find factory that can create such transport.
+	 *
+	 * If there's an existing transport, its place in the hash table
+	 * will be replaced by this new one. And eventually the existing
+	 * transport will still be freed (by application or #1774).
+	 */
+	if (sel && sel->type == PJSIP_TPSELECTOR_LISTENER && sel->u.listener)
+	{
+	    /* Application has requested that a specific listener is to
+	     * be used.
+	     */
+
+	    /* Verify that the listener type matches the destination type */
+	    /* Already checked above. */
+	    /*
+	    if (sel->u.listener->type != type) {
+		pj_lock_release(mgr->lock);
+		return PJSIP_ETPNOTSUITABLE;
+	    }
+	    */
+
+	    /* We'll use this listener to create transport */
+	    factory = sel->u.listener;
+
+	    /* Verify if listener is still valid */
+	    if (!pjsip_tpmgr_is_tpfactory_valid(mgr, factory)) {
+		pj_lock_release(mgr->lock);
+		PJ_LOG(3,(THIS_FILE, "Specified factory for creating "
+				     "transport is not found"));
+		return PJ_ENOTFOUND;
+	    }
+
+	} else {
+
+	    /* Find factory with type matches the destination type */
+	    factory = mgr->factory_list.next;
+	    while (factory != &mgr->factory_list) {
+		if (factory->type == type)
+		    break;
+		factory = factory->next;
+	    }
+
+	    if (factory == &mgr->factory_list) {
+		/* No factory can create the transport! */
+		pj_lock_release(mgr->lock);
+		TRACE_((THIS_FILE, "No suitable factory was found either"));
+		return PJSIP_EUNSUPTRANSPORT;
+	    }
+	}
+    }
+
+    TRACE_((THIS_FILE, "Creating new transport from factory"));
+
+    /* Request factory to create transport. */
+    if (factory->create_transport2) {
+	status = factory->create_transport2(factory, mgr, mgr->endpt,
+					    (const pj_sockaddr*) remote,
+					    addr_len, tdata, tp);
+    } else {
+	status = factory->create_transport(factory, mgr, mgr->endpt,
+					   (const pj_sockaddr*) remote,
+					   addr_len, tp);
+    }
+    if (status == PJ_SUCCESS) {
+	PJ_ASSERT_ON_FAIL(tp!=NULL,
+	    {pj_lock_release(mgr->lock); return PJ_EBUG;});
+	pjsip_transport_add_ref(*tp);
+	(*tp)->factory = factory;
+    }
+    pj_lock_release(mgr->lock);
+    return status;
+}
+
+/**
+ * Dump transport info.
+ */
+PJ_DEF(void) pjsip_tpmgr_dump_transports(pjsip_tpmgr *mgr)
+{
+#if PJ_LOG_MAX_LEVEL >= 3
+    pj_hash_iterator_t itr_val;
+    pj_hash_iterator_t *itr;
+    pjsip_tpfactory *factory;
+
+    pj_lock_acquire(mgr->lock);
+
+#if defined(PJ_DEBUG) && PJ_DEBUG!=0
+    PJ_LOG(3,(THIS_FILE, " Outstanding transmit buffers: %d",
+	      pj_atomic_get(mgr->tdata_counter)));
+#endif
+
+    PJ_LOG(3, (THIS_FILE, " Dumping listeners:"));
+    factory = mgr->factory_list.next;
+    while (factory != &mgr->factory_list) {
+	PJ_LOG(3, (THIS_FILE, "  %s %s:%.*s:%d", 
+		   factory->obj_name,
+		   factory->type_name,
+		   (int)factory->addr_name.host.slen,
+		   factory->addr_name.host.ptr,
+		   (int)factory->addr_name.port));
+	factory = factory->next;
+    }
+
+    itr = pj_hash_first(mgr->table, &itr_val);
+    if (itr) {
+	PJ_LOG(3, (THIS_FILE, " Dumping transports:"));
+
+	do {
+	    transport *tp_entry = (transport *) pj_hash_this(mgr->table, itr);
+	    if (tp_entry) {
+		transport *tp_iter = tp_entry;
+
+		do {
+		    pjsip_transport *tp_ref = tp_iter->tp;
+
+		    PJ_LOG(3, (THIS_FILE, "  %s %s%s%s%s(refcnt=%d%s)",
+			       tp_ref->obj_name,
+			       tp_ref->info,
+			       (tp_ref->factory)?" listener[":"",
+			       (tp_ref->factory)?tp_ref->factory->obj_name:"",
+			       (tp_ref->factory)?"]":"",
+			       pj_atomic_get(tp_ref->ref_cnt),
+			       (tp_ref->idle_timer.id ? " [idle]" : "")));
+
+		    tp_iter = tp_iter->next;
+		} while (tp_iter != tp_entry);
+	    }
+	    itr = pj_hash_next(mgr->table, itr);
+	} while (itr);
+    }
+
+    pj_lock_release(mgr->lock);
+#else
+    PJ_UNUSED_ARG(mgr);
+#endif
+}
+
+/**
+ * Set callback of global transport state notification.
+ */
+PJ_DEF(pj_status_t) pjsip_tpmgr_set_state_cb(pjsip_tpmgr *mgr,
+					     pjsip_tp_state_callback cb)
+{
+    PJ_ASSERT_RETURN(mgr, PJ_EINVAL);
+
+    mgr->tp_state_cb = cb;
+
+    return PJ_SUCCESS;
+}
+
+/**
+ * Get callback of global transport state notification.
+ */
+PJ_DEF(pjsip_tp_state_callback) pjsip_tpmgr_get_state_cb(
+					     const pjsip_tpmgr *mgr)
+{
+    PJ_ASSERT_RETURN(mgr, NULL);
+
+    return mgr->tp_state_cb;
+}
+
+
+/**
+ * Allocate and init transport data.
+ */
+static void init_tp_data(pjsip_transport *tp)
+{
+    transport_data *tp_data;
+
+    pj_assert(tp && !tp->data);
+
+    tp_data = PJ_POOL_ZALLOC_T(tp->pool, transport_data);
+    pj_list_init(&tp_data->st_listeners);
+    pj_list_init(&tp_data->st_listeners_empty);
+    tp->data = tp_data;
+}
+
+
+static void tp_state_callback(pjsip_transport *tp,
+			      pjsip_transport_state state,
+			      const pjsip_transport_state_info *info)
+{
+    transport_data *tp_data;
+
+    pj_lock_acquire(tp->lock);
+
+    tp_data = (transport_data*)tp->data;
+
+    /* Notify the transport state listeners, if any. */
+    if (!tp_data || pj_list_empty(&tp_data->st_listeners)) {
+	goto on_return;
+    } else {
+	pjsip_transport_state_info st_info;
+	tp_state_listener *st_listener = tp_data->st_listeners.next;
+
+	/* As we need to put the user data into the transport state info,
+	 * let's use a copy of transport state info.
+	 */
+	pj_memcpy(&st_info, info, sizeof(st_info));
+	while (st_listener != &tp_data->st_listeners) {
+	    st_info.user_data = st_listener->user_data;
+	    (*st_listener->cb)(tp, state, &st_info);
+
+	    st_listener = st_listener->next;
+	}
+    }
+
+on_return:
+    pj_lock_release(tp->lock);
+}
+
+
+/**
+ * Add a listener to the specified transport for transport state notification.
+ */
+PJ_DEF(pj_status_t) pjsip_transport_add_state_listener (
+					    pjsip_transport *tp,
+					    pjsip_tp_state_callback cb,
+					    void *user_data,
+					    pjsip_tp_state_listener_key **key)
+{
+    transport_data *tp_data;
+    tp_state_listener *entry;
+
+    PJ_ASSERT_RETURN(tp && cb && key, PJ_EINVAL);
+
+    if (tp->is_shutdown) {
+	*key = NULL;
+	return PJ_EINVALIDOP;
+    }
+
+    pj_lock_acquire(tp->lock);
+
+    /* Init transport data, if it hasn't */
+    if (!tp->data)
+	init_tp_data(tp);
+
+    tp_data = (transport_data*)tp->data;
+
+    /* Init the new listener entry. Use available empty slot, if any,
+     * otherwise allocate it using the transport pool.
+     */
+    if (!pj_list_empty(&tp_data->st_listeners_empty)) {
+	entry = tp_data->st_listeners_empty.next;
+	pj_list_erase(entry);
+    } else {
+	entry = PJ_POOL_ZALLOC_T(tp->pool, tp_state_listener);
+    }
+    entry->cb = cb;
+    entry->user_data = user_data;
+
+    /* Add the new listener entry to the listeners list */
+    pj_list_push_back(&tp_data->st_listeners, entry);
+
+    *key = entry;
+
+    pj_lock_release(tp->lock);
+
+    return PJ_SUCCESS;
+}
+
+/**
+ * Remove a listener from the specified transport for transport state 
+ * notification.
+ */
+PJ_DEF(pj_status_t) pjsip_transport_remove_state_listener (
+				    pjsip_transport *tp,
+				    pjsip_tp_state_listener_key *key,
+				    const void *user_data)
+{
+    transport_data *tp_data;
+    tp_state_listener *entry;
+
+    PJ_ASSERT_RETURN(tp && key, PJ_EINVAL);
+
+    pj_lock_acquire(tp->lock);
+
+    tp_data = (transport_data*)tp->data;
+
+    /* Transport data is NULL or no registered listener? */
+    if (!tp_data || pj_list_empty(&tp_data->st_listeners)) {
+	pj_lock_release(tp->lock);
+	return PJ_ENOTFOUND;
+    }
+
+    entry = (tp_state_listener*)key;
+
+    /* Validate the user data */
+    if (entry->user_data != user_data) {
+	pj_assert(!"Invalid transport state listener key");
+	pj_lock_release(tp->lock);
+	return PJ_EBUG;
+    }
+
+    /* Reset the entry and move it to the empty list */
+    entry->cb = NULL;
+    entry->user_data = NULL;
+    pj_list_erase(entry);
+    pj_list_push_back(&tp_data->st_listeners_empty, entry);
+
+    pj_lock_release(tp->lock);
+
+    return PJ_SUCCESS;
+}
+
+/*
+ * Set callback of data dropping.
+ */
+PJ_DEF(pj_status_t) pjsip_tpmgr_set_drop_data_cb(pjsip_tpmgr *mgr,
+						 pjsip_tp_on_rx_dropped_cb cb)
+{
+    PJ_ASSERT_RETURN(mgr, PJ_EINVAL);
+
+    mgr->tp_drop_data_cb = cb;
+
+    return PJ_SUCCESS;
+}
