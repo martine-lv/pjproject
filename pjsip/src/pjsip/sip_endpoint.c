@@ -925,19 +925,27 @@ PJ_DEF(pj_status_t) pjsip_endpt_process_rx_data( pjsip_endpoint *endpt,
 
     /* Distribute */
     if (msg->type == PJSIP_REQUEST_MSG) {
+	PJ_LOG(1, ("Martin:", "This is a incoming request !...from:sip_endpoint.c:pjsip_endpt_process_rx_data()"));
 	do {
-	    if (mod->on_rx_request)
+	    if (mod->on_rx_request){
 		handled = (*mod->on_rx_request)(rdata);
-	    if (handled)
-		break;
+		PJ_LOG(1, ("Martin:", "%s is handling this message!...from:sip_endpoint.c:pjsip_endpt_process_rx_data()",mod->name));
+		}
+	    if (handled){
+		PJ_LOG(1, ("Martin:", "%s has handles this message sussfully,stop call other modules!...from:sip_endpoint.c:pjsip_endpt_process_rx_data()",mod->name));
+		break;}
 	    mod = mod->next;
 	} while (mod != &endpt->module_list);
     } else {
+	PJ_LOG(1, ("Martin:", "This is a incoming response !...from:sip_endpoint.c:pjsip_endpt_process_rx_data()",mod->name));
 	do {
-	    if (mod->on_rx_response)
+	    if (mod->on_rx_response){
 		handled = (*mod->on_rx_response)(rdata);
-	    if (handled)
-		break;
+		PJ_LOG(1, ("Martin:", "%s is handling this message!...from:sip_endpoint.c:pjsip_endpt_process_rx_data()",mod->name));
+		}
+	    if (handled){
+		PJ_LOG(1, ("Martin:", "%s has handled this message successfully!...from:sip_endpoint.c:pjsip_endpt_process_rx_data()",mod->name));
+		break;}
 	    mod = mod->next;
 	} while (mod != &endpt->module_list);
     }
@@ -963,6 +971,7 @@ static void endpt_on_rx_msg( pjsip_endpoint *endpt,
 			     pj_status_t status,
 			     pjsip_rx_data *rdata )
 {
+	PJ_LOG(1, ("Martin:", "Received a sip message from transport :sip_endpoint.c:endpt_on_rx_msg()"));
     pjsip_msg *msg = rdata->msg_info.msg;
     pjsip_process_rdata_param proc_prm;
     pj_bool_t handled = PJ_FALSE;
@@ -1020,6 +1029,7 @@ static void endpt_on_rx_msg( pjsip_endpoint *endpt,
      * Ref: RFC3261 Section 18.1.2 Receiving Response
      */
     if (msg->type == PJSIP_RESPONSE_MSG) {
+	PJ_LOG(1, ("Martin:", "This is a incoming response !:sip_endpoint.c:endpt_on_rx_msg()"));
 	const pj_str_t *local_addr;
 	int port = rdata->msg_info.via->sent_by.port;
 	pj_bool_t mismatch = PJ_FALSE;
@@ -1108,9 +1118,10 @@ static pj_status_t endpt_on_tx_msg( pjsip_endpoint *endpt,
 
     /* Distribute to modules, starting from modules with LOWEST priority */
     LOCK_MODULE_ACCESS(endpt);
-
+    PJ_LOG(1, ("Martin:", "call modules to handle the outgoing message from the module with lowest priority!...from:sip_endpoint.c:endpt_on_tx_msg()"));
     mod = endpt->module_list.prev;
     if (tdata->msg->type == PJSIP_REQUEST_MSG) {
+	PJ_LOG(1, ("Martin:", "Outgoing message is a request!...from:sip_endpoint.c:endpt_on_tx_msg()"));
 	while (mod != &endpt->module_list) {
 	    if (mod->on_tx_request)
 		status = (*mod->on_tx_request)(tdata);
@@ -1118,13 +1129,16 @@ static pj_status_t endpt_on_tx_msg( pjsip_endpoint *endpt,
 		break;
 	    mod = mod->prev;
 	}
-
     } else {
+	PJ_LOG(1, ("Martin:", "Outgoing message is a response!...from:sip_endpoint.c:endpt_on_tx_msg()"));
 	while (mod != &endpt->module_list) {
-	    if (mod->on_tx_response)
+	    if (mod->on_tx_response){
 		status = (*mod->on_tx_response)(tdata);
-	    if (status != PJ_SUCCESS)
-		break;
+		PJ_LOG(1, ("Martin:", "%s handel the outgoing message successfully!...from:sip_endpoint.c:endpt_on_tx_msg()",mod->name));
+		}
+	    if (status != PJ_SUCCESS){
+		PJ_LOG(1, ("Martin:", "%s handel the outgoing message failed!...from:sip_endpoint.c:endpt_on_tx_msg()",mod->name));
+		break;}
 	    mod = mod->prev;
 	}
     }
